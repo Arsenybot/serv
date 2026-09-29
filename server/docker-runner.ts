@@ -5,6 +5,7 @@ import { paasStore } from './store.ts';
 import { Project, Deployment } from './types.ts';
 import { decryptValue } from './crypto.ts';
 import { prepareSource, cleanupSourceDir } from './source-preparer.ts';
+import { traefikDynamicManager } from './traefik-manager.ts';
 
 const DOCKER_HOST_URL = process.env.DOCKER_HOST || 'http://dockerproxy:2375';
 
@@ -47,9 +48,18 @@ export interface UnifiedHealthCheckResult {
  * Docker Runner & Orchestrator with:
  * 1. Local source preparation (git clone/fetch with retry, GitHub Tarball fallback with exact SHA)
  * 2. Local Docker build context (no remote git context)
- * 3. Unified health verification (Docker Health + Direct HTTP Health + Traefik HTTP Routing Verification)
- * 4. Zero-downtime safety: old container is untouched until new passes all checks
- * 5. Automatic cleanup of failed new container on failure
+ * 3. Deployment-specific Traefik service: `<projectSlug>-dep-<shortId>`
+ * 4. Deployment-specific verification router: `<projectSlug>-deploy-<shortId>.<domain>`
+ * 5. Multi-phase verification:
+ *    - Docker container running check
+ *    - Docker container healthcheck probe (if configured)
+ *    - Direct HTTP probe (new container only)
+ *    - Deployment-specific verification router probe (new container only, HTTP 2xx)
+ *    - Explicit atomic production switch
+ *    - Post-switch production route verification (HTTP 2xx)
+ *    - Graceful stop of old container only after successful production verification
+ * 6. Zero-downtime safety: old container is untouched until new passes all checks
+ * 7. Verification router cleanup and rollback recovery
  */
 export class DockerRunner {
   private containerStatsIntervals: Map<string, NodeJS.Timeout> = new Map();
@@ -135,23 +145,33 @@ export class DockerRunner {
     options: {
       isRollback?: boolean;
       reuseImageName?: string;
-      simulateFailure?: 'build' | 'start' | 'health' | 'traefik';
+      simulateFailure?: 'build' | 'start' | 'health' | 'traefik_verify' | 'production_switch' | 'production_verify';
       forceTarballFallback?: boolean;
     } = {}
   ): Promise<boolean> {
     const deploymentId = deployment.id;
     const projectSlug = project.slug || project.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+    const shortDepId = deploymentId.replace(/^dep-/, '').slice(0, 8);
+    const traefikServiceName = `${projectSlug}-dep-${shortDepId}`;
+    const verificationRouterName = `${projectSlug}-verify-${shortDepId}`;
+    const traefikDomain = process.env.TRAEFIK_DOMAIN || 'localhost';
+    const verificationHost = `${projectSlug}-deploy-${shortDepId}.${traefikDomain}`;
+    const productionDomain = project.domain || `${projectSlug}.${traefikDomain}`;
+
     let shortSha = deployment.commitSha && !deployment.commitSha.startsWith('init-')
       ? deployment.commitSha.slice(0, 7)
       : 'latest';
     let imageName = options.reuseImageName || `local-paas/${projectSlug}:${shortSha}`;
-    const containerId = `project-${projectSlug}-${deploymentId.slice(-6)}`;
+    const containerId = `project-${projectSlug}-${shortDepId}`;
     const hostPort = allocateHostPort();
 
     paasStore.updateDeployment(deploymentId, {
       imageName,
       containerId,
       hostPort,
+      traefikServiceName,
+      verificationRouterName,
+      verificationHost,
     });
 
     const oldDeploymentId = project.currentDeploymentId;
@@ -249,7 +269,7 @@ export class DockerRunner {
         paasStore.addLog(deploymentId, 'build', `Image ${imageName} built successfully.`);
       }
 
-      // Step 2: STARTING CONTAINER
+      // Step 2: STARTING CONTAINER WITH DEPLOYMENT-SPECIFIC LABELS
       paasStore.updateDeployment(deploymentId, { status: 'STARTING' });
       paasStore.addLog(deploymentId, 'system', `Creating container ${containerId} in localpaas_network...`);
 
@@ -263,17 +283,20 @@ export class DockerRunner {
         envList.push(`PORT=${targetInternalPort}`);
       }
 
-      const domainRule = `Host(\`${project.domain || `${projectSlug}.localhost`}\`)`;
-
+      // Deployment-specific labels:
+      // Router & Service are uniquely tied to THIS deployment: <projectSlug>-dep-<shortId>
+      // The verification router rule is Host(`<projectSlug>-deploy-<shortId>.<domain>`)
+      // NO generic shared service is used!
       const containerConfig = {
         Image: imageName,
         name: containerId,
         Env: envList,
         Labels: {
           'traefik.enable': 'true',
-          [`traefik.http.routers.${projectSlug}.rule`]: domainRule,
-          [`traefik.http.routers.${projectSlug}.entrypoints`]: 'web',
-          [`traefik.http.services.${projectSlug}.loadbalancer.server.port`]: String(targetInternalPort),
+          [`traefik.http.routers.${verificationRouterName}.rule`]: `Host(\`${verificationHost}\`)`,
+          [`traefik.http.routers.${verificationRouterName}.entrypoints`]: 'web',
+          [`traefik.http.routers.${verificationRouterName}.service`]: traefikServiceName,
+          [`traefik.http.services.${traefikServiceName}.loadbalancer.server.port`]: String(targetInternalPort),
         },
         HostConfig: {
           NetworkMode: 'localpaas_network',
@@ -349,9 +372,24 @@ export class DockerRunner {
 
       paasStore.addLog(deploymentId, 'system', `Container ${containerId} running on mapped port ${hostPort}.`);
 
-      // Step 3: UNIFIED HEALTH VERIFICATION (Docker Health + Direct HTTP Health + Traefik Routing Verification)
+      // Register with dynamic Traefik File Provider as single source of truth for routers/services
+      traefikDynamicManager.registerDeployment({
+        projectSlug,
+        deploymentId,
+        containerId,
+        internalPort: targetInternalPort,
+        traefikDomain,
+      });
+
+      paasStore.addLog(
+        deploymentId,
+        'system',
+        `Registered isolated Traefik service: ${traefikServiceName} and verification router: ${verificationRouterName} (Host: ${verificationHost})`
+      );
+
+      // Step 3: MULTI-PHASE HEALTH & DEDICATED VERIFICATION ROUTE CHECK
       paasStore.updateDeployment(deploymentId, { status: 'HEALTH_CHECK' });
-      paasStore.addLog(deploymentId, 'system', `Initiating comprehensive health verification...`);
+      paasStore.addLog(deploymentId, 'system', `Initiating comprehensive health and route verification...`);
 
       const healthResult = await this.verifyContainerHealth({
         project,
@@ -359,7 +397,7 @@ export class DockerRunner {
         hostPort,
         internalPort: targetInternalPort,
         deploymentId,
-        checkTraefik: true,
+        verificationHost,
         simulateFailure: options.simulateFailure,
       });
 
@@ -367,14 +405,17 @@ export class DockerRunner {
         paasStore.addLog(
           deploymentId,
           'stderr',
-          `CRITICAL: Health verification failed: ${healthResult.errorMessage || 'Probes unsuccessful'}. Aborting deployment.`
+          `CRITICAL: Verification failed: ${healthResult.errorMessage || 'Probes unsuccessful'}. Aborting deployment.`
         );
-        paasStore.addLog(deploymentId, 'system', `Stopping and removing failed new container ${containerId}...`);
+        paasStore.addLog(deploymentId, 'system', `Cleaning up verification router and removing new container ${containerId}...`);
+        traefikDynamicManager.removeVerificationRouter(projectSlug, verificationRouterName);
+        traefikDynamicManager.removeDeploymentService(projectSlug, traefikServiceName);
         await this.cleanupContainer(containerId);
+
         paasStore.addLog(
           deploymentId,
           'system',
-          `[ZERO-DOWNTIME PRESERVED]: Active container (${oldDeployment?.containerId || 'previous'}) remains LIVE!`
+          `[ZERO-DOWNTIME PRESERVED]: Active container (${oldDeployment?.containerId || 'previous'}) remains LIVE on production!`
         );
         paasStore.updateDeployment(deploymentId, {
           status: 'HEALTH_CHECK_FAILED',
@@ -384,27 +425,127 @@ export class DockerRunner {
         return false;
       }
 
-      paasStore.addLog(deploymentId, 'system', `Ready signal received! Health check PASSED.`);
-      paasStore.addLog(deploymentId, 'system', `New deployment verified through Traefik. Ready for live traffic.`);
+      paasStore.addLog(
+        deploymentId,
+        'system',
+        `Verification router check PASSED (Host: ${verificationHost} -> HTTP 200 via ${traefikServiceName}).`
+      );
 
-      // Step 4: GRACEFULLY STOP OLD CONTAINER ONLY AFTER NEW PASSES ALL HEALTH & TRAEFIK CHECKS
+      // Step 4: ATOMIC PRODUCTION SWITCH
+      paasStore.addLog(
+        deploymentId,
+        'system',
+        `Initiating explicit production switch: Host('${productionDomain}') -> ${traefikServiceName}...`
+      );
+
+      if (options.simulateFailure === 'production_switch') {
+        paasStore.addLog(deploymentId, 'stderr', `Simulation: Production router switch failed`);
+        traefikDynamicManager.removeVerificationRouter(projectSlug, verificationRouterName);
+        traefikDynamicManager.removeDeploymentService(projectSlug, traefikServiceName);
+        await this.cleanupContainer(containerId);
+        paasStore.addLog(
+          deploymentId,
+          'system',
+          `[ZERO-DOWNTIME PRESERVED]: Production switch aborted. Old deployment remains active.`
+        );
+        paasStore.updateDeployment(deploymentId, {
+          status: 'HEALTH_CHECK_FAILED',
+          errorMessage: 'Simulated production switch failure',
+          healthPassed: false,
+        });
+        return false;
+      }
+
+      traefikDynamicManager.switchProductionRouter({
+        projectSlug,
+        productionDomain,
+        traefikServiceName,
+      });
+
+      paasStore.addLog(
+        deploymentId,
+        'system',
+        `Production router switched. Verifying production traffic on http://${productionDomain}...`
+      );
+
+      // Step 5: VERIFY PRODUCTION AFTER SWITCH
+      const prodVerifyPassed = await this.verifyProductionRoute({
+        productionDomain,
+        healthPath: project.healthPath || '/api/health',
+        timeoutSec: project.healthTimeout || 5,
+        simulateFailure: options.simulateFailure,
+      });
+
+      if (!prodVerifyPassed) {
+        paasStore.addLog(
+          deploymentId,
+          'stderr',
+          `Production verification failed after switch. Initiating emergency rollback to previous deployment...`
+        );
+
+        // Emergency rollback switch
+        if (oldDeployment && oldDeployment.traefikServiceName) {
+          traefikDynamicManager.switchProductionRouter({
+            projectSlug,
+            productionDomain,
+            traefikServiceName: oldDeployment.traefikServiceName,
+          });
+          paasStore.addLog(
+            deploymentId,
+            'system',
+            `Emergency rollback complete: Production router restored to ${oldDeployment.traefikServiceName}.`
+          );
+        }
+
+        // Cleanup failed new deployment
+        traefikDynamicManager.removeVerificationRouter(projectSlug, verificationRouterName);
+        traefikDynamicManager.removeDeploymentService(projectSlug, traefikServiceName);
+        await this.cleanupContainer(containerId);
+
+        paasStore.updateDeployment(deploymentId, {
+          status: 'HEALTH_CHECK_FAILED',
+          errorMessage: 'Production route verification failed after switch',
+          healthPassed: false,
+        });
+        return false;
+      }
+
+      paasStore.addLog(
+        deploymentId,
+        'system',
+        `Production route verified: http://${productionDomain} successfully serving traffic from ${traefikServiceName}!`
+      );
+
+      // Step 6: CLEANUP VERIFICATION ROUTER
+      traefikDynamicManager.removeVerificationRouter(projectSlug, verificationRouterName);
+      paasStore.addLog(deploymentId, 'system', `Cleaned up temporary verification router: ${verificationRouterName}.`);
+
+      // Step 7: GRACEFULLY STOP OLD CONTAINER ONLY AFTER PRODUCTION IS CONFIRMED
       if (oldDeployment && oldDeployment.containerId && oldDeployment.id !== deploymentId) {
         paasStore.addLog(
           deploymentId,
           'system',
           `Stopping old container: ${oldDeployment.containerId} (zero-downtime switch completed)...`
         );
+        if (oldDeployment.traefikServiceName) {
+          traefikDynamicManager.removeDeploymentService(projectSlug, oldDeployment.traefikServiceName);
+        }
         await this.cleanupContainer(oldDeployment.containerId, 10);
         paasStore.addLog(deploymentId, 'system', `Old container ${oldDeployment.containerId} stopped.`);
       }
 
-      // Step 5: MARK LIVE
+      // Step 8: MARK LIVE & UPDATE PROJECT
       paasStore.updateDeployment(deploymentId, {
         status: 'LIVE',
         healthPassed: true,
       });
 
-      const publicUrl = `http://${project.domain || `${projectSlug}.localhost`}`;
+      paasStore.updateProject(project.id, {
+        status: 'LIVE',
+        currentDeploymentId: deploymentId,
+      });
+
+      const publicUrl = `http://${productionDomain}`;
       paasStore.addLog(deploymentId, 'system', `Deployment ${deploymentId} is now LIVE! Public URL: ${publicUrl}`);
       paasStore.addLog(deploymentId, 'stdout', `App ready. Direct host access: http://localhost:${hostPort}`);
 
@@ -413,7 +554,10 @@ export class DockerRunner {
     } catch (err: any) {
       paasStore.addLog(deploymentId, 'stderr', `Deployment pipeline exception: ${err.message || String(err)}`);
       // Cleanup new container if created
+      traefikDynamicManager.removeVerificationRouter(projectSlug, verificationRouterName);
+      traefikDynamicManager.removeDeploymentService(projectSlug, traefikServiceName);
       await this.cleanupContainer(containerId);
+
       paasStore.addLog(
         deploymentId,
         'system',
@@ -503,11 +647,12 @@ export class DockerRunner {
   }
 
   /**
-   * Unified Health Verification Service used by executeDeployment, startProject, and restartProject:
-   * 1. Inspects Docker container state (must be running, not restarting/exited)
-   * 2. Inspects Docker Healthcheck status (if configured: starting -> healthy / unhealthy)
-   * 3. Probes Direct HTTP health check endpoint on container IP/name and hostPort (2xx)
-   * 4. Probes Traefik HTTP routing with Host header to verify reverse proxy points to the new deployment (2xx)
+   * Unified Health Verification Service:
+   * 1. Inspects Docker container state (running check)
+   * 2. Inspects Docker Healthcheck status (if configured)
+   * 3. Probes Direct HTTP health check endpoint on container
+   * 4. Probes Deployment-Specific Verification Router on Traefik (Host: <project>-deploy-<depId>.<domain>)
+   *    This CANNOT hit OLD container because OLD does not possess this router/service!
    */
   public async verifyContainerHealth(options: {
     project: Project;
@@ -515,8 +660,8 @@ export class DockerRunner {
     hostPort: number;
     internalPort?: number;
     deploymentId?: string;
-    checkTraefik?: boolean;
-    simulateFailure?: 'build' | 'start' | 'health' | 'traefik';
+    verificationHost?: string;
+    simulateFailure?: 'build' | 'start' | 'health' | 'traefik_verify' | 'production_switch' | 'production_verify';
   }): Promise<UnifiedHealthCheckResult> {
     const {
       project,
@@ -524,7 +669,7 @@ export class DockerRunner {
       hostPort,
       internalPort = project.internalPort || 3000,
       deploymentId,
-      checkTraefik = true,
+      verificationHost,
       simulateFailure,
     } = options;
 
@@ -545,15 +690,15 @@ export class DockerRunner {
           errorMessage: 'Simulated health check failed',
         };
       }
-      if (simulateFailure === 'traefik') {
+      if (simulateFailure === 'traefik_verify') {
         log('Direct HTTP health: 200 OK', 'system');
-        log('Traefik health verification failed. Expected HTTP 2xx. Received HTTP 502.', 'stderr');
+        log(`Verification router HTTP request (Host: ${verificationHost}) failed: HTTP 502 Bad Gateway`, 'stderr');
         return {
           passed: false,
           dockerHealth: 'healthy',
           directHttpPassed: true,
           traefikPassed: false,
-          errorMessage: 'Traefik health verification failed: HTTP 502 Bad Gateway',
+          errorMessage: 'Traefik verification router failed: HTTP 502 Bad Gateway',
         };
       }
       return {
@@ -622,7 +767,7 @@ export class DockerRunner {
         log(`Docker inspect probe warning: ${err.message}`);
       }
 
-      // 2. Direct HTTP probe (probes both containerId in Docker network and hostPort)
+      // 2. Direct HTTP probe to the new container
       directHttpPassed = await this.probeDirectHttp(containerId, internalPort, hostPort, healthPath, timeoutSec);
       if (directHttpPassed) {
         log(`Direct HTTP health probe GET ${healthPath} -> HTTP 200 OK`);
@@ -644,14 +789,15 @@ export class DockerRunner {
       };
     }
 
-    // Phase 2: Traefik Routing Verification
+    // Phase 2: Traefik Verification Router Check
+    // Verifies the deployment-specific verification router (Host: <project>-deploy-<depId>.<domain>)
     let traefikPassed = true;
-    if (checkTraefik) {
-      log(`Verifying HTTP request routing through Traefik reverse proxy...`);
-      traefikPassed = await this.verifyTraefikRoute(project, healthPath, timeoutSec, 8);
+    if (verificationHost) {
+      log(`Verifying isolated verification router on Traefik: Host='${verificationHost}'...`);
+      traefikPassed = await this.probeTraefikHost(verificationHost, healthPath, timeoutSec, 8);
       if (!traefikPassed) {
         log(
-          `Traefik routing verification failed: reverse proxy did not route traffic cleanly to new deployment`,
+          `Verification router check failed: Traefik did not route Host '${verificationHost}' cleanly to new deployment`,
           'stderr'
         );
         return {
@@ -659,10 +805,10 @@ export class DockerRunner {
           dockerHealth: dockerHealthStatus,
           directHttpPassed: true,
           traefikPassed: false,
-          errorMessage: 'Traefik HTTP routing verification failed',
+          errorMessage: `Verification router probe failed for Host: ${verificationHost}`,
         };
       }
-      log(`Traefik routing verified: Reverse proxy successfully routed HTTP 200 response.`);
+      log(`Verification router confirmed: Host '${verificationHost}' returned HTTP 200 OK.`);
     }
 
     return {
@@ -671,6 +817,27 @@ export class DockerRunner {
       directHttpPassed: true,
       traefikPassed,
     };
+  }
+
+  /**
+   * Verifies production route after atomic switch
+   */
+  public async verifyProductionRoute(options: {
+    productionDomain: string;
+    healthPath: string;
+    timeoutSec: number;
+    simulateFailure?: string;
+  }): Promise<boolean> {
+    const { productionDomain, healthPath, timeoutSec, simulateFailure } = options;
+
+    if (process.env.NODE_ENV === 'test') {
+      if (simulateFailure === 'production_verify') {
+        return false;
+      }
+      return true;
+    }
+
+    return await this.probeTraefikHost(productionDomain, healthPath, timeoutSec, 6);
   }
 
   /**
@@ -715,19 +882,15 @@ export class DockerRunner {
   }
 
   /**
-   * Verifies routing through Traefik by sending HTTP request with Host header to Traefik service
+   * Probes Traefik reverse proxy by specifying exact Host header
    */
-  private async verifyTraefikRoute(
-    project: Project,
+  private async probeTraefikHost(
+    hostHeader: string,
     healthPath: string,
     timeoutSec: number,
     maxRetries: number = 8
   ): Promise<boolean> {
-    const projectSlug = project.slug || project.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-    const domain = project.domain || `${projectSlug}.localhost`;
     const formattedPath = healthPath.startsWith('/') ? healthPath : `/${healthPath}`;
-
-    // Traefik endpoints: 'traefik' service on port 80 inside localpaas_network, or localhost:80
     const hostsToTry = ['traefik', 'localpaas_traefik', 'localhost', '127.0.0.1'];
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -737,7 +900,7 @@ export class DockerRunner {
           port: 80,
           path: formattedPath,
           headers: {
-            Host: domain,
+            Host: hostHeader,
             'User-Agent': 'LocalPaaS-TraefikVerifier/1.0',
           },
           timeoutMs: timeoutSec * 1000,
@@ -822,7 +985,8 @@ export class DockerRunner {
   }
 
   /**
-   * Start project using unified health verification service
+   * Start project using unified blue-green deployment service:
+   * Unique service -> Health -> Verification route -> Production switch -> LIVE
    */
   public async startProject(project: Project): Promise<boolean> {
     const deploymentId = project.currentDeploymentId;
@@ -838,10 +1002,22 @@ export class DockerRunner {
           hostPort: dep.hostPort || 9010,
           internalPort: project.internalPort || 3000,
           deploymentId,
-          checkTraefik: true,
+          verificationHost: dep.verificationHost,
         });
 
         if (health.passed) {
+          // Explicit production switch
+          const projectSlug = project.slug || project.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+          const traefikDomain = process.env.TRAEFIK_DOMAIN || 'localhost';
+          const productionDomain = project.domain || `${projectSlug}.${traefikDomain}`;
+          const serviceName = dep.traefikServiceName || `${projectSlug}-dep-${dep.id.replace(/^dep-/, '').slice(0, 8)}`;
+
+          traefikDynamicManager.switchProductionRouter({
+            projectSlug,
+            productionDomain,
+            traefikServiceName: serviceName,
+          });
+
           paasStore.updateProject(project.id, { status: 'LIVE' });
           paasStore.updateDeployment(deploymentId, { status: 'LIVE' });
           this.startStatsMonitoring(project.id, dep.containerId);
@@ -863,8 +1039,8 @@ export class DockerRunner {
   }
 
   /**
-   * Restart project using unified zero-downtime health verification:
-   * Starts new/updated container, verifies health & Traefik route before switching.
+   * Restart project using unified blue-green zero-downtime health verification:
+   * Starts new container with isolated service, verifies health & verification route before switching.
    */
   public async restartProject(project: Project): Promise<boolean> {
     const deploymentId = project.currentDeploymentId;

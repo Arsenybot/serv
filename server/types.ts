@@ -52,9 +52,13 @@ export interface Deployment {
   imageName?: string;
   containerId?: string;
   hostPort?: number;
+  traefikServiceName?: string;
+  verificationRouterName?: string;
+  verificationHost?: string;
   errorMessage?: string;
   healthPassed?: boolean;
 }
+
 
 export interface EnvironmentVariable {
   id: string;

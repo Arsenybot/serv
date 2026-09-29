@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Traefik Reverse Proxy with automatic Docker container discovery
+  # Traefik Reverse Proxy with automatic Docker container discovery and dynamic file provider
   traefik:
     image: traefik:v3.1
     container_name: localpaas_traefik
@@ -12,6 +12,8 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=localpaas_network"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
     ports:
       - "80:80"        # Public application traffic
@@ -19,8 +21,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik_data:/etc/traefik
+      - traefik_dynamic:/etc/traefik/dynamic
     networks:
       - localpaas_network
+
 
   # PostgreSQL Database for persistent metadata
   postgres:
@@ -84,6 +88,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - build_cache:/tmp/localpaas_builds
+      - traefik_dynamic:/etc/traefik/dynamic
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,4 +124,6 @@ volumes:
   postgres_data:
   redis_data:
   traefik_data:
+  traefik_dynamic:
   build_cache:
+

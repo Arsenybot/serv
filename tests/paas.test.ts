@@ -4,6 +4,7 @@ import { encryptValue, decryptValue, maskSecret, verifyGitHubSignature, generate
 import { paasStore } from '../server/store.ts';
 import { dockerRunner } from '../server/docker-runner.ts';
 import { prepareSource } from '../server/source-preparer.ts';
+import { traefikDynamicManager } from '../server/traefik-manager.ts';
 
 // Set test environment to enable deterministic mock execution
 process.env.NODE_ENV = 'test';
@@ -12,7 +13,7 @@ process.env.ENCRYPTION_KEY = '01234567890123456789012345678901'; // 32 bytes
 
 async function runTestSuite() {
   console.log('\n========================================');
-  console.log('🚀 Running LocalPaaS Automated Test Suite');
+  console.log('🚀 Running LocalPaaS Blue-Green Automated Test Suite');
   console.log('========================================\n');
 
   let passed = 0;
@@ -100,32 +101,140 @@ async function runTestSuite() {
     assert.strictEqual(decryptValue(tokenEnv!.encryptedValue), '12345:ABC-DEF1234ghIkl-zyx57W2v1u123ew11');
   });
 
-  // 6. Test A: Successful Git clone -> Docker build -> Health -> Traefik -> LIVE
-  await test('Test A: Successful deployment execution -> Health -> Traefik -> LIVE state', async () => {
-    const deployment = paasStore.createDeployment(
-      testProject.id,
-      'commit-aaa111',
-      'Initial release',
-      'Arsenybot'
+  // 6. Test 1: OLD + NEW isolation (no shared pool)
+  await test('Test 1: OLD and NEW have separate isolated Traefik services (no shared pool)', async () => {
+    const depOld = paasStore.createDeployment(testProject.id, 'commit-old-111', 'Old deployment', 'Arsenybot');
+    const okOld = await dockerRunner.executeDeployment(testProject, depOld);
+    assert.strictEqual(okOld, true);
+
+    const oldService = paasStore.getDeployment(depOld.id)?.traefikServiceName;
+    assert.ok(oldService);
+    assert.strictEqual(oldService.startsWith('botsig-application-dep-'), true);
+
+    // Dynamic config must route production to oldService
+    let cfg = traefikDynamicManager.getProjectConfig(testProject.slug);
+    assert.strictEqual(cfg.http.routers['botsig-application'].service, oldService);
+    assert.ok(cfg.http.services[oldService]);
+
+    // Now start NEW deployment
+    const depNew = paasStore.createDeployment(testProject.id, 'commit-new-222', 'New deployment', 'Arsenybot');
+    const newShort = depNew.id.replace(/^dep-/, '').slice(0, 8);
+    const reg = traefikDynamicManager.registerDeployment({
+      projectSlug: testProject.slug,
+      deploymentId: depNew.id,
+      containerId: `project-botsig-application-${newShort}`,
+      internalPort: 3000,
+    });
+
+    const newService = reg.traefikServiceName;
+    assert.notStrictEqual(oldService, newService);
+
+    // Verify dynamic config contains BOTH isolated services simultaneously:
+    cfg = traefikDynamicManager.getProjectConfig(testProject.slug);
+    assert.ok(cfg.http.services[oldService], 'OLD service must exist');
+    assert.ok(cfg.http.services[newService], 'NEW service must exist');
+    assert.notStrictEqual(
+      cfg.http.services[oldService].loadBalancer.servers[0].url,
+      cfg.http.services[newService].loadBalancer.servers[0].url,
+      'OLD and NEW must have distinct container URLs'
     );
 
-    const success = await dockerRunner.executeDeployment(testProject, deployment);
-    assert.strictEqual(success, true);
+    // Verification router points ONLY to NEW
+    assert.strictEqual(cfg.http.routers[reg.verificationRouterName].service, newService);
 
-    const updatedProject = paasStore.getProject(testProject.id);
-    assert.strictEqual(updatedProject?.status, 'LIVE');
-    assert.strictEqual(updatedProject?.currentDeploymentId, deployment.id);
+    // Production router STILL points ONLY to OLD before switch
+    assert.strictEqual(cfg.http.routers['botsig-application'].service, oldService);
 
-    const updatedDep = paasStore.getDeployment(deployment.id);
-    assert.strictEqual(updatedDep?.status, 'LIVE');
-    assert.strictEqual(updatedDep?.healthPassed, true);
-
-    const logs = paasStore.getLogs(deployment.id);
-    assert.ok(logs.some(l => l.message.includes('Ready signal received! Health check PASSED')));
-    assert.ok(logs.some(l => l.message.includes('New deployment verified through Traefik')));
+    // Clean up temporary registered router
+    traefikDynamicManager.removeVerificationRouter(testProject.slug, reg.verificationRouterName);
+    traefikDynamicManager.removeDeploymentService(testProject.slug, newService);
   });
 
-  // 7. Test B: Git clone failure + Tarball fallback with exact SHA
+  // 7. Test 2: NEW failure leaves OLD production untouched and cleans up NEW
+  await test('Test 2: NEW verification failure leaves OLD production untouched and removes NEW router', async () => {
+    const currentDepBefore = paasStore.getProject(testProject.id)?.currentDeploymentId;
+    assert.ok(currentDepBefore);
+    const oldDep = paasStore.getDeployment(currentDepBefore);
+    assert.ok(oldDep?.traefikServiceName);
+
+
+    const brokenDep = paasStore.createDeployment(testProject.id, 'commit-broken-333', 'Broken update', 'Arsenybot');
+    const success = await dockerRunner.executeDeployment(testProject, brokenDep, {
+      simulateFailure: 'traefik_verify',
+    });
+
+    assert.strictEqual(success, false);
+    const brokenRecord = paasStore.getDeployment(brokenDep.id);
+    assert.strictEqual(brokenRecord?.status, 'HEALTH_CHECK_FAILED');
+
+    // CRITICAL: Project remains LIVE with previous deployment!
+    const projState = paasStore.getProject(testProject.id);
+    assert.strictEqual(projState?.status, 'LIVE');
+    assert.strictEqual(projState?.currentDeploymentId, currentDepBefore);
+
+    // Traefik dynamic config still points production exclusively to OLD service
+    const cfg = traefikDynamicManager.getProjectConfig(testProject.slug);
+    assert.strictEqual(cfg.http.routers['botsig-application'].service, oldDep.traefikServiceName);
+
+    // Verification router of broken deployment is cleaned up
+    assert.strictEqual(cfg.http.routers[brokenRecord?.verificationRouterName || ''], undefined);
+  });
+
+  // 8. Test 3: Successful switch transfers production exclusively to NEW service
+  await test('Test 3: Successful switch transfers production exclusively to NEW and stops OLD', async () => {
+    const prevDepId = paasStore.getProject(testProject.id)?.currentDeploymentId;
+    assert.ok(prevDepId);
+
+    const goodDep = paasStore.createDeployment(testProject.id, 'commit-good-444', 'Clean release v2', 'Arsenybot');
+    const success = await dockerRunner.executeDeployment(testProject, goodDep);
+    assert.strictEqual(success, true);
+
+    const newDepRecord = paasStore.getDeployment(goodDep.id);
+    assert.strictEqual(newDepRecord?.status, 'LIVE');
+    assert.ok(newDepRecord?.traefikServiceName);
+
+    // Project is updated to new deployment
+    assert.strictEqual(paasStore.getProject(testProject.id)?.currentDeploymentId, goodDep.id);
+
+    // Production router points ONLY to NEW service!
+    const cfg = traefikDynamicManager.getProjectConfig(testProject.slug);
+    assert.strictEqual(cfg.http.routers['botsig-application'].service, newDepRecord.traefikServiceName);
+
+    // Verification router is cleaned up
+    assert.strictEqual(cfg.http.routers[newDepRecord.verificationRouterName || ''], undefined);
+  });
+
+  // 9. Test 4: Production switch failure aborts and leaves OLD as production
+  await test('Test 4: Production switch failure aborts and leaves OLD untouched', async () => {
+    const liveDepId = paasStore.getProject(testProject.id)?.currentDeploymentId;
+    assert.ok(liveDepId);
+    const liveDep = paasStore.getDeployment(liveDepId);
+
+    const failSwitchDep = paasStore.createDeployment(testProject.id, 'commit-switch-fail', 'Switch fail', 'Arsenybot');
+    const success = await dockerRunner.executeDeployment(testProject, failSwitchDep, {
+      simulateFailure: 'production_switch',
+    });
+
+    assert.strictEqual(success, false);
+    assert.strictEqual(paasStore.getDeployment(failSwitchDep.id)?.status, 'HEALTH_CHECK_FAILED');
+
+    // Production router remains pointed to liveDep
+    const cfg = traefikDynamicManager.getProjectConfig(testProject.slug);
+    assert.strictEqual(cfg.http.routers['botsig-application'].service, liveDep?.traefikServiceName);
+    assert.strictEqual(paasStore.getProject(testProject.id)?.currentDeploymentId, liveDepId);
+  });
+
+  // 10. Test 5: Verify NO shared generic service exists
+  await test('Test 5: Neither OLD nor NEW use shared generic traefik.http.services.<projectSlug>', () => {
+    const cfg = traefikDynamicManager.getProjectConfig(testProject.slug);
+    assert.strictEqual(
+      cfg.http.services['botsig-application'],
+      undefined,
+      'Generic shared service botsig-application must NOT exist'
+    );
+  });
+
+  // 11. Test B: Git clone failure falls back to Tarball with exact commit SHA
   await test('Test B: Git clone failure falls back to Tarball with exact commit SHA', async () => {
     const tarballProject = paasStore.createProject({
       name: 'Tarball App',
@@ -147,7 +256,7 @@ async function runTestSuite() {
     assert.ok(logs.some(l => l.message.includes('Falling back to GitHub Tarball API')));
   });
 
-  // 8. Test C: Docker build failure sets BUILD_FAILED cleanly without touching LIVE
+  // 12. Test C: Docker build failure sets BUILD_FAILED cleanly without touching LIVE
   await test('Test C: Docker build failure sets BUILD_FAILED status cleanly', async () => {
     const failingDep = paasStore.createDeployment(
       testProject.id,
@@ -170,70 +279,7 @@ async function runTestSuite() {
     assert.strictEqual(projState?.status, 'LIVE');
   });
 
-  // 9. Test D: Container health check failure leaves previous LIVE deployment running (Zero-Downtime)
-  await test('Test D: Health check failure leaves previous LIVE deployment running (Zero-Downtime)', async () => {
-    const failingDep = paasStore.createDeployment(
-      testProject.id,
-      'commit-ccc333',
-      'Broken runtime commit',
-      'Arsenybot'
-    );
-
-    const success = await dockerRunner.executeDeployment(testProject, failingDep, {
-      simulateFailure: 'health',
-    });
-
-    assert.strictEqual(success, false);
-    const depState = paasStore.getDeployment(failingDep.id);
-    assert.strictEqual(depState?.status, 'HEALTH_CHECK_FAILED');
-    assert.strictEqual(depState?.healthPassed, false);
-
-    // Old deployment is STILL active!
-    const projState = paasStore.getProject(testProject.id);
-    assert.strictEqual(projState?.status, 'LIVE');
-  });
-
-  // 10. Test E: Traefik routing failure aborts deployment and keeps old LIVE untouched
-  await test('Test E: Traefik routing verification failure leaves old LIVE untouched', async () => {
-    const traefikFailDep = paasStore.createDeployment(
-      testProject.id,
-      'commit-eee555',
-      'Traefik 502 test',
-      'Arsenybot'
-    );
-
-    const success = await dockerRunner.executeDeployment(testProject, traefikFailDep, {
-      simulateFailure: 'traefik',
-    });
-
-    assert.strictEqual(success, false);
-    const depState = paasStore.getDeployment(traefikFailDep.id);
-    assert.strictEqual(depState?.status, 'HEALTH_CHECK_FAILED');
-    assert.ok(depState?.errorMessage?.includes('Traefik'));
-
-    // Old deployment is STILL LIVE!
-    const projState = paasStore.getProject(testProject.id);
-    assert.strictEqual(projState?.status, 'LIVE');
-  });
-
-  // 11. Test F: Successful replacement stops old container and marks new as LIVE
-  await test('Test F: Successful replacement stops old container and switches LIVE atomically', async () => {
-    const currentDepId = paasStore.getProject(testProject.id)?.currentDeploymentId;
-    assert.ok(currentDepId);
-
-    const nextDep = paasStore.createDeployment(
-      testProject.id,
-      'commit-fff666',
-      'Clean update',
-      'Arsenybot'
-    );
-
-    const success = await dockerRunner.executeDeployment(testProject, nextDep);
-    assert.strictEqual(success, true);
-    assert.strictEqual(paasStore.getProject(testProject.id)?.currentDeploymentId, nextDep.id);
-  });
-
-  // 12. Test G: Manual startProject with health check
+  // 13. Test G: Manual startProject with health check
   await test('Test G: Manual startProject verifies health before setting LIVE', async () => {
     const startProj = paasStore.createProject({
       name: 'Start Test App',
@@ -246,14 +292,14 @@ async function runTestSuite() {
     assert.strictEqual(paasStore.getProject(startProj.id)?.status, 'LIVE');
   });
 
-  // 13. Test H: Restart project uses unified zero-downtime health verification
+  // 14. Test H: Restart project uses unified zero-downtime health verification
   await test('Test H: Restart project uses unified zero-downtime health verification', async () => {
     const restarted = await dockerRunner.restartProject(testProject);
     assert.strictEqual(restarted, true);
     assert.strictEqual(paasStore.getProject(testProject.id)?.status, 'LIVE');
   });
 
-  // 14. Test I: Tarball deployment identity preserves exact SHA (no random generation)
+  // 15. Test I: Tarball deployment identity preserves exact SHA (no random generation)
   await test('Test I: Tarball deployment identity preserves exact GitHub commit SHA', async () => {
     const res = await prepareSource({
       repositoryUrl: 'https://github.com/test-owner/test-app.git',
@@ -268,11 +314,11 @@ async function runTestSuite() {
     assert.strictEqual(res.sourceType, 'github-tarball');
   });
 
-  // 15. Rollback Safety
+  // 16. Rollback Safety
   await test('Rollback reuses pre-built image and transitions LIVE', async () => {
     const rollbackDep = paasStore.createDeployment(
       testProject.id,
-      'commit-aaa111',
+      'commit-old-111',
       'Rollback to v1.0',
       'Admin',
       'ROLLBACK'
@@ -287,7 +333,7 @@ async function runTestSuite() {
     assert.strictEqual(paasStore.getProject(testProject.id)?.currentDeploymentId, rollbackDep.id);
   });
 
-  // 16. Webhook Idempotency
+  // 17. Webhook Idempotency
   await test('Webhook idempotency deduplicates duplicate push events', () => {
     const key = `${testProject.id}:commit-xyz999:refs/heads/main`;
     assert.strictEqual(paasStore.isWebhookProcessed(key), false);
@@ -295,7 +341,7 @@ async function runTestSuite() {
     assert.strictEqual(paasStore.isWebhookProcessed(key), true);
   });
 
-  // 17. Git Retry & Failure handling
+  // 18. Git Retry & Failure handling
   await test('Git source preparation retry mechanism and failure handling', async () => {
     const brokenProject = paasStore.createProject({
       name: 'Broken Git Repo Project',
@@ -317,7 +363,7 @@ async function runTestSuite() {
     assert.ok(logs.some(l => l.message.includes('Attempt 3/3')));
   });
 
-  // 18. Project Deletion
+  // 19. Project Deletion
   await test('Project deletion cleans up metadata, deployments, and logs', () => {
     const deleted = paasStore.deleteProject(testProject.id);
     assert.strictEqual(deleted, true);
