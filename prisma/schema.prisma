@@ -1,0 +1,136 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum ProjectStatus {
+  LIVE
+  BUILDING
+  FAILED
+  STOPPED
+  CRASHED
+}
+
+enum DeploymentStatus {
+  QUEUED
+  BUILDING
+  STARTING
+  HEALTH_CHECK
+  LIVE
+  BUILD_FAILED
+  START_FAILED
+  HEALTH_CHECK_FAILED
+  CANCELLED
+}
+
+enum BuildType {
+  DOCKERFILE
+  NODEJS
+  PYTHON
+  STATIC
+}
+
+model Project {
+  id                  String                @id @default(uuid())
+  name                String                @unique
+  repositoryUrl       String
+  repositoryOwner     String
+  repositoryName      String
+  branch              String                @default("main")
+  buildType           BuildType             @default(DOCKERFILE)
+  dockerfilePath      String?               @default("Dockerfile")
+  buildCommand        String?
+  startCommand        String?
+  internalPort        Int                   @default(3000)
+  status              ProjectStatus         @default(STOPPED)
+  currentDeploymentId String?
+  autoDeploy          Boolean               @default(true)
+  cpuLimit            String?               @default("1")
+  memoryLimit         String?               @default("512m")
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  deployments          Deployment[]
+  environmentVariables EnvironmentVariable[]
+  domains              Domain[]
+  healthCheck          HealthCheck?
+
+  @@index([repositoryOwner, repositoryName])
+}
+
+model Deployment {
+  id            String           @id @default(uuid())
+  projectId     String
+  commitSha     String
+  commitMessage String?
+  status        DeploymentStatus @default(QUEUED)
+  startedAt     DateTime         @default(now())
+  finishedAt    DateTime?
+  imageName     String?
+  containerId   String?
+  errorMessage  String?
+
+  project Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  logs    DeploymentLog[]
+
+  @@index([projectId, status])
+  @@index([commitSha])
+}
+
+model EnvironmentVariable {
+  id             String   @id @default(uuid())
+  projectId      String
+  key            String
+  encryptedValue String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, key])
+}
+
+model DeploymentLog {
+  id           String   @id @default(uuid())
+  deploymentId String
+  timestamp    DateTime @default(now())
+  stream       String   @default("stdout") // stdout, stderr, build, system
+  message      String
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@index([deploymentId, timestamp])
+}
+
+model Domain {
+  id        String   @id @default(uuid())
+  projectId String
+  hostname  String   @unique
+  enabled   Boolean  @default(true)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model HealthCheck {
+  id        String   @id @default(uuid())
+  projectId String   @unique
+  path      String   @default("/health")
+  timeout   Int      @default(5)  // in seconds
+  interval  Int      @default(3)  // in seconds
+  retries   Int      @default(10)
+  status    String   @default("UNKNOWN") // HEALTHY, UNHEALTHY, UNKNOWN
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model GitHubRepository {
+  id            String   @id @default(uuid())
+  fullName      String   @unique // e.g. "owner/repo"
+  defaultBranch String   @default("main")
+  webhookId     String?
+  createdAt     DateTime @default(now())
+}

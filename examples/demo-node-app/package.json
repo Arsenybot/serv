@@ -1,0 +1,10 @@
+{
+  "name": "demo-node-app",
+  "version": "1.0.0",
+  "description": "Minimal demo app for LocalPaaS automated zero-downtime deployment",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}

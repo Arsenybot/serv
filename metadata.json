@@ -1,0 +1,6 @@
+{
+  "name": "LocalPaaS - Self-Hosted GitHub Deployment Server",
+  "description": "Self-hosted automated local deployment platform from GitHub to Docker with zero-downtime, Traefik reverse proxy, real-time logs, and health checks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

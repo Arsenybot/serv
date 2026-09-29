@@ -1,0 +1,122 @@
+version: '3.8'
+
+services:
+  # Traefik Reverse Proxy with automatic Docker container discovery
+  traefik:
+    image: traefik:v3.1
+    container_name: localpaas_traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=localpaas_network"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"        # Public application traffic
+      - "8080:8080"    # Traefik Dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_data:/etc/traefik
+    networks:
+      - localpaas_network
+
+  # PostgreSQL Database for persistent metadata
+  postgres:
+    image: postgres:16-alpine
+    container_name: localpaas_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-paas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-paas_password_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-paas}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - localpaas_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-paas} -d ${POSTGRES_DB:-paas}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for BullMQ deployment queues
+  redis:
+    image: redis:7-alpine
+    container_name: localpaas_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - localpaas_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # LocalPaaS API Server & Web UI
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    container_name: localpaas_api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-paas}:${POSTGRES_PASSWORD:-paas_password_change_me}@postgres:5432/${POSTGRES_DB:-paas}?schema=public
+      - REDIS_URL=redis://redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - TRAEFIK_DOMAIN=${TRAEFIK_DOMAIN:-localhost}
+      - CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+      - DEFAULT_CPU_LIMIT=${DEFAULT_CPU_LIMIT:-1}
+      - DEFAULT_MEMORY_LIMIT=${DEFAULT_MEMORY_LIMIT:-512m}
+      - MAX_DEPLOYMENTS_PER_PROJECT=${MAX_DEPLOYMENTS_PER_PROJECT:-10}
+      - JWT_SECRET=${JWT_SECRET:-super_secret_jwt_key_for_internal_auth}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-super_secret_aes256_encryption_key_32_bytes_long}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - build_cache:/tmp/localpaas_builds
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - localpaas_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.paas.rule=Host(`paas.localhost`)"
+      - "traefik.http.routers.paas.entrypoints=web"
+      - "traefik.http.services.paas.loadbalancer.server.port=3000"
+
+  # Optional Cloudflare Tunnel for zero-config public domain exposure
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: localpaas_tunnel
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - localpaas_network
+    profiles:
+      - tunnel
+
+networks:
+  localpaas_network:
+    name: localpaas_network
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  traefik_data:
+  build_cache:

@@ -1,0 +1,14 @@
+# Traefik Dynamic Configuration
+http:
+  routers:
+    paas-api:
+      rule: "Host(`paas.localhost`)"
+      entryPoints:
+        - "web"
+      service: "paas-api-service"
+
+  services:
+    paas-api-service:
+      loadBalancer:
+        servers:
+          - url: "http://api:3000"
