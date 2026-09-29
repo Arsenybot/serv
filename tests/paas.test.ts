@@ -174,13 +174,64 @@ async function runTestSuite() {
     assert.strictEqual(paasStore.isWebhookProcessed(key), true);
   });
 
-  // 11. Project Deletion
+  // 11. Git Retry & Failure handling
+  await test('Git source preparation retry mechanism and failure handling', async () => {
+    const brokenProject = paasStore.createProject({
+      name: 'Broken Git Repo Project',
+      repositoryUrl: 'https://github.com/non-existent-user-12345/non-existent-repo-99999.git',
+      branch: 'main',
+      buildType: 'DOCKERFILE',
+    });
+
+    const brokenDep = paasStore.createDeployment(brokenProject.id, 'abc0001', 'Test broken git');
+    const success = await dockerRunner.executeDeployment(brokenProject, brokenDep);
+    assert.strictEqual(success, false);
+
+    const depState = paasStore.getDeployment(brokenDep.id);
+    assert.strictEqual(depState?.status, 'BUILD_FAILED');
+    assert.ok(depState?.errorMessage?.includes('Failed to fetch repository'));
+
+    const logs = paasStore.getLogs(brokenDep.id);
+    assert.ok(logs.some(l => l.message.includes('Attempt 1/3')));
+    assert.ok(logs.some(l => l.message.includes('Attempt 3/3')));
+  });
+
+  // 12. Startup Failure keeps previous LIVE deployment running
+  await test('Container startup failure keeps previous LIVE deployment untouched', async () => {
+    const liveProj = paasStore.createProject({
+      name: 'Startup Test Project',
+      repositoryUrl: 'https://github.com/test-owner/test-app.git',
+      branch: 'main',
+    });
+
+    // Create active live deployment
+    const liveDep = paasStore.createDeployment(liveProj.id, 'sha-live-1', 'Initial good release');
+    await dockerRunner.executeDeployment(liveProj, liveDep);
+    assert.strictEqual(paasStore.getProject(liveProj.id)?.status, 'LIVE');
+
+    // Create new deployment that fails on start
+    const startFailDep = paasStore.createDeployment(liveProj.id, 'sha-fail-start', 'Failing start commit');
+    const success = await dockerRunner.executeDeployment(liveProj, startFailDep, {
+      simulateFailure: 'start',
+    });
+
+    assert.strictEqual(success, false);
+    assert.strictEqual(paasStore.getDeployment(startFailDep.id)?.status, 'START_FAILED');
+    
+    // CRITICAL: Live project is STILL LIVE with previous deployment!
+    const projAfterFail = paasStore.getProject(liveProj.id);
+    assert.strictEqual(projAfterFail?.status, 'LIVE');
+    assert.strictEqual(projAfterFail?.currentDeploymentId, liveDep.id);
+  });
+
+  // 13. Project Deletion
   await test('Project deletion cleans up metadata, deployments, and logs', () => {
     const deleted = paasStore.deleteProject(testProject.id);
     assert.strictEqual(deleted, true);
     assert.strictEqual(paasStore.getProject(testProject.id), undefined);
     assert.strictEqual(paasStore.getDeploymentsForProject(testProject.id).length, 0);
   });
+
 
   console.log('\n========================================');
   console.log(`Test Summary: ${passed} passed, ${failed} failed`);
