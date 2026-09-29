@@ -101,3 +101,11 @@ export function slugify(name: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '') || 'app';
 }
+
+export const generateProjectSlug = slugify;
+export const maskSecret = (val: string) => {
+  if (!val) return '••••';
+  if (val.length <= 6) return '••••';
+  return `••••${val.slice(-4)}`;
+};
+

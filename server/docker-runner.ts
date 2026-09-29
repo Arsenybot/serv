@@ -1,5 +1,4 @@
 import http from 'http';
-import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { paasStore } from './store.ts';
@@ -36,12 +35,20 @@ function allocateHostPort(): number {
   return portCounter++;
 }
 
+export interface UnifiedHealthCheckResult {
+  passed: boolean;
+  dockerHealth: 'healthy' | 'unhealthy' | 'none' | 'stopped';
+  directHttpPassed: boolean;
+  traefikPassed: boolean;
+  errorMessage?: string;
+}
+
 /**
  * Docker Runner & Orchestrator with:
- * 1. Local source preparation (git clone/fetch with retry and auth)
+ * 1. Local source preparation (git clone/fetch with retry, GitHub Tarball fallback with exact SHA)
  * 2. Local Docker build context (no remote git context)
- * 3. Actual Docker Healthcheck + HTTP Health verification
- * 4. Zero-downtime safety: old container is untouched until new passes health checks
+ * 3. Unified health verification (Docker Health + Direct HTTP Health + Traefik HTTP Routing Verification)
+ * 4. Zero-downtime safety: old container is untouched until new passes all checks
  * 5. Automatic cleanup of failed new container on failure
  */
 export class DockerRunner {
@@ -128,12 +135,15 @@ export class DockerRunner {
     options: {
       isRollback?: boolean;
       reuseImageName?: string;
-      simulateFailure?: 'build' | 'start' | 'health';
+      simulateFailure?: 'build' | 'start' | 'health' | 'traefik';
+      forceTarballFallback?: boolean;
     } = {}
   ): Promise<boolean> {
     const deploymentId = deployment.id;
     const projectSlug = project.slug || project.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-    let shortSha = deployment.commitSha ? deployment.commitSha.slice(0, 7) : 'latest';
+    let shortSha = deployment.commitSha && !deployment.commitSha.startsWith('init-')
+      ? deployment.commitSha.slice(0, 7)
+      : 'latest';
     let imageName = options.reuseImageName || `local-paas/${projectSlug}:${shortSha}`;
     const containerId = `project-${projectSlug}-${deploymentId.slice(-6)}`;
     const hostPort = allocateHostPort();
@@ -169,6 +179,7 @@ export class DockerRunner {
           projectName: project.name,
           onLog: (msg, stream = 'build') => paasStore.addLog(deploymentId, stream, msg),
           maxAttempts: 3,
+          forceTarballFallback: options.forceTarballFallback,
         });
 
         if (!prepResult.success) {
@@ -298,7 +309,6 @@ export class DockerRunner {
       try {
         createRes = await this.dockerRequest('POST', `/containers/create?name=${containerId}`, containerConfig);
       } catch (err: any) {
-        // In test mode without Docker daemon running
         if (process.env.NODE_ENV === 'test') {
           createRes = { statusCode: 201 };
         } else {
@@ -339,62 +349,45 @@ export class DockerRunner {
 
       paasStore.addLog(deploymentId, 'system', `Container ${containerId} running on mapped port ${hostPort}.`);
 
-      // Step 3: HEALTH VERIFICATION (Docker Healthcheck + HTTP Healthcheck)
+      // Step 3: UNIFIED HEALTH VERIFICATION (Docker Health + Direct HTTP Health + Traefik Routing Verification)
       paasStore.updateDeployment(deploymentId, { status: 'HEALTH_CHECK' });
       paasStore.addLog(deploymentId, 'system', `Initiating comprehensive health verification...`);
 
-      if (options.simulateFailure === 'health') {
-        paasStore.addLog(deploymentId, 'stderr', `Health check failed: simulated health probe error HTTP 503`);
-        paasStore.addLog(deploymentId, 'system', `Cleaning up failed new container ${containerId}...`);
-        await this.cleanupContainer(containerId);
-        paasStore.addLog(
-          deploymentId,
-          'system',
-          `[ZERO-DOWNTIME PRESERVED]: Old container (${oldDeployment?.containerId || 'none'}) remains LIVE!`
-        );
-        paasStore.updateDeployment(deploymentId, {
-          status: 'HEALTH_CHECK_FAILED',
-          errorMessage: 'Simulated health check failed',
-          healthPassed: false,
-        });
-        return false;
-      }
+      const healthResult = await this.verifyContainerHealth({
+        project,
+        containerId,
+        hostPort,
+        internalPort: targetInternalPort,
+        deploymentId,
+        checkTraefik: true,
+        simulateFailure: options.simulateFailure,
+      });
 
-      const healthPassed = await this.verifyHealth(project, containerId, hostPort, deploymentId);
-
-      if (!healthPassed) {
+      if (!healthResult.passed) {
         paasStore.addLog(
           deploymentId,
           'stderr',
-          `CRITICAL: Health verification failed. Aborting deployment transition.`
+          `CRITICAL: Health verification failed: ${healthResult.errorMessage || 'Probes unsuccessful'}. Aborting deployment.`
         );
-        paasStore.addLog(deploymentId, 'system', `Stopping and removing failed container ${containerId}...`);
+        paasStore.addLog(deploymentId, 'system', `Stopping and removing failed new container ${containerId}...`);
         await this.cleanupContainer(containerId);
         paasStore.addLog(
           deploymentId,
           'system',
-          `[ZERO-DOWNTIME PRESERVED]: Active container (${oldDeployment?.containerId || 'previous'}) remains LIVE.`
+          `[ZERO-DOWNTIME PRESERVED]: Active container (${oldDeployment?.containerId || 'previous'}) remains LIVE!`
         );
         paasStore.updateDeployment(deploymentId, {
           status: 'HEALTH_CHECK_FAILED',
-          errorMessage: `Health check probe failed on path ${project.healthPath || '/api/health'}`,
+          errorMessage: healthResult.errorMessage || 'Health verification failed',
           healthPassed: false,
         });
         return false;
       }
 
       paasStore.addLog(deploymentId, 'system', `Ready signal received! Health check PASSED.`);
-      paasStore.addLog(deploymentId, 'system', `New deployment passed health checks. Ready for live traffic.`);
+      paasStore.addLog(deploymentId, 'system', `New deployment verified through Traefik. Ready for live traffic.`);
 
-      // Step 4: ATOMIC TRAEFIK SWITCH & TRAFFIC ROUTING VERIFICATION
-      paasStore.addLog(deploymentId, 'system', `Verifying Traefik reverse proxy routing...`);
-      paasStore.addLog(
-        deploymentId,
-        'system',
-        `Traefik reverse proxy updated. Domain http://${project.domain} points to ${containerId}.`
-      );
-
-      // Step 5: GRACEFULLY STOP OLD CONTAINER ONLY AFTER NEW IS HEALTHY
+      // Step 4: GRACEFULLY STOP OLD CONTAINER ONLY AFTER NEW PASSES ALL HEALTH & TRAEFIK CHECKS
       if (oldDeployment && oldDeployment.containerId && oldDeployment.id !== deploymentId) {
         paasStore.addLog(
           deploymentId,
@@ -405,7 +398,7 @@ export class DockerRunner {
         paasStore.addLog(deploymentId, 'system', `Old container ${oldDeployment.containerId} stopped.`);
       }
 
-      // Step 6: MARK LIVE
+      // Step 5: MARK LIVE
       paasStore.updateDeployment(deploymentId, {
         status: 'LIVE',
         healthPassed: true,
@@ -510,19 +503,65 @@ export class DockerRunner {
   }
 
   /**
-   * Comprehensive health verification:
+   * Unified Health Verification Service used by executeDeployment, startProject, and restartProject:
    * 1. Inspects Docker container state (must be running, not restarting/exited)
    * 2. Inspects Docker Healthcheck status (if configured: starting -> healthy / unhealthy)
-   * 3. Probes HTTP health check endpoint on hostPort (configurable path, timeout, retries)
+   * 3. Probes Direct HTTP health check endpoint on container IP/name and hostPort (2xx)
+   * 4. Probes Traefik HTTP routing with Host header to verify reverse proxy points to the new deployment (2xx)
    */
-  private async verifyHealth(
-    project: Project,
-    containerId: string,
-    hostPort: number,
-    deploymentId: string
-  ): Promise<boolean> {
+  public async verifyContainerHealth(options: {
+    project: Project;
+    containerId: string;
+    hostPort: number;
+    internalPort?: number;
+    deploymentId?: string;
+    checkTraefik?: boolean;
+    simulateFailure?: 'build' | 'start' | 'health' | 'traefik';
+  }): Promise<UnifiedHealthCheckResult> {
+    const {
+      project,
+      containerId,
+      hostPort,
+      internalPort = project.internalPort || 3000,
+      deploymentId,
+      checkTraefik = true,
+      simulateFailure,
+    } = options;
+
+    const log = (msg: string, stream: 'system' | 'stderr' | 'stdout' = 'system') => {
+      if (deploymentId) {
+        paasStore.addLog(deploymentId, stream, msg);
+      }
+    };
+
     if (process.env.NODE_ENV === 'test') {
-      return true;
+      if (simulateFailure === 'health') {
+        log('Health check failed: simulated health probe error HTTP 503', 'stderr');
+        return {
+          passed: false,
+          dockerHealth: 'unhealthy',
+          directHttpPassed: false,
+          traefikPassed: false,
+          errorMessage: 'Simulated health check failed',
+        };
+      }
+      if (simulateFailure === 'traefik') {
+        log('Direct HTTP health: 200 OK', 'system');
+        log('Traefik health verification failed. Expected HTTP 2xx. Received HTTP 502.', 'stderr');
+        return {
+          passed: false,
+          dockerHealth: 'healthy',
+          directHttpPassed: true,
+          traefikPassed: false,
+          errorMessage: 'Traefik health verification failed: HTTP 502 Bad Gateway',
+        };
+      }
+      return {
+        passed: true,
+        dockerHealth: 'healthy',
+        directHttpPassed: true,
+        traefikPassed: true,
+      };
     }
 
     const healthPath = project.healthPath || '/api/health';
@@ -530,102 +569,215 @@ export class DockerRunner {
     const intervalSec = project.healthInterval || 2;
     const timeoutSec = project.healthTimeout || 5;
 
-    paasStore.addLog(
-      deploymentId,
-      'system',
-      `Health configuration: Path='${healthPath}', Retries=${maxRetries}, Interval=${intervalSec}s, Timeout=${timeoutSec}s`
+    log(
+      `Unified Health Check Configuration: Path='${healthPath}', Retries=${maxRetries}, Interval=${intervalSec}s, Timeout=${timeoutSec}s`
     );
 
-    let hasDockerHealthcheck = false;
+    let dockerHealthStatus: 'healthy' | 'unhealthy' | 'none' | 'stopped' = 'none';
+    let directHttpPassed = false;
 
+    // Phase 1: Docker Inspect & Direct HTTP Verification
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      // 1. Inspect container via Docker API
+      // 1. Docker API Container Inspect
       try {
         const inspectRes = await this.dockerRequest('GET', `/containers/${containerId}/json`);
         if (inspectRes.statusCode === 200 && inspectRes.json) {
           const state = inspectRes.json.State;
-
           if (!state.Running) {
-            paasStore.addLog(
-              deploymentId,
-              'stderr',
-              `Container stopped running unexpectedly (ExitCode: ${state.ExitCode}, Error: ${state.Error || 'none'})`
+            log(
+              `Container stopped running unexpectedly (ExitCode: ${state.ExitCode}, Error: ${state.Error || 'none'})`,
+              'stderr'
             );
-            return false;
+            return {
+              passed: false,
+              dockerHealth: 'stopped',
+              directHttpPassed: false,
+              traefikPassed: false,
+              errorMessage: `Container exited unexpectedly with code ${state.ExitCode}`,
+            };
           }
 
           if (state.Health) {
-            hasDockerHealthcheck = true;
             const hStatus = state.Health.Status; // 'starting' | 'healthy' | 'unhealthy'
-            paasStore.addLog(deploymentId, 'system', `Docker Healthcheck: ${hStatus} (attempt ${attempt}/${maxRetries})`);
+            log(`Docker Healthcheck: ${hStatus} (attempt ${attempt}/${maxRetries})`);
 
             if (hStatus === 'unhealthy') {
-              paasStore.addLog(deploymentId, 'stderr', `Docker Healthcheck reported UNHEALTHY state`);
-              return false;
+              log(`Docker Healthcheck reported UNHEALTHY state`, 'stderr');
+              return {
+                passed: false,
+                dockerHealth: 'unhealthy',
+                directHttpPassed: false,
+                traefikPassed: false,
+                errorMessage: 'Docker Healthcheck reported UNHEALTHY',
+              };
             }
 
             if (hStatus === 'healthy') {
-              paasStore.addLog(deploymentId, 'system', `Docker Healthcheck verified: HEALTHY`);
-              // Proceed with HTTP probe confirmation
+              dockerHealthStatus = 'healthy';
+              log(`Docker Healthcheck verified: HEALTHY`);
             }
           }
         }
       } catch (err: any) {
-        paasStore.addLog(deploymentId, 'system', `Docker inspect probe warning: ${err.message}`);
+        log(`Docker inspect probe warning: ${err.message}`);
       }
 
-      // 2. HTTP Health Probe
-      const httpPassed = await this.probeHttpHealth(hostPort, healthPath, timeoutSec);
-      if (httpPassed) {
-        paasStore.addLog(
-          deploymentId,
-          'system',
-          `HTTP probe GET http://localhost:${hostPort}${healthPath} -> HTTP 200 OK (latency: healthy)`
-        );
-        return true;
+      // 2. Direct HTTP probe (probes both containerId in Docker network and hostPort)
+      directHttpPassed = await this.probeDirectHttp(containerId, internalPort, hostPort, healthPath, timeoutSec);
+      if (directHttpPassed) {
+        log(`Direct HTTP health probe GET ${healthPath} -> HTTP 200 OK`);
+        break;
       }
 
-      paasStore.addLog(
-        deploymentId,
-        'system',
-        `Attempt ${attempt}/${maxRetries}: HTTP probe on ${healthPath} pending (waiting ${intervalSec}s)...`
-      );
-
+      log(`Attempt ${attempt}/${maxRetries}: Direct HTTP probe pending on ${healthPath}...`);
       await this.delay(intervalSec * 1000);
     }
 
-    // Final probe attempt
-    const finalProbe = await this.probeHttpHealth(hostPort, healthPath, timeoutSec);
-    if (finalProbe) {
-      paasStore.addLog(deploymentId, 'system', `HTTP probe GET ${healthPath} -> HTTP 200 OK`);
-      return true;
+    if (!directHttpPassed) {
+      log(`Direct HTTP health check failed after ${maxRetries} attempts on path ${healthPath}`, 'stderr');
+      return {
+        passed: false,
+        dockerHealth: dockerHealthStatus,
+        directHttpPassed: false,
+        traefikPassed: false,
+        errorMessage: `Direct HTTP probe failed on path ${healthPath}`,
+      };
+    }
+
+    // Phase 2: Traefik Routing Verification
+    let traefikPassed = true;
+    if (checkTraefik) {
+      log(`Verifying HTTP request routing through Traefik reverse proxy...`);
+      traefikPassed = await this.verifyTraefikRoute(project, healthPath, timeoutSec, 8);
+      if (!traefikPassed) {
+        log(
+          `Traefik routing verification failed: reverse proxy did not route traffic cleanly to new deployment`,
+          'stderr'
+        );
+        return {
+          passed: false,
+          dockerHealth: dockerHealthStatus,
+          directHttpPassed: true,
+          traefikPassed: false,
+          errorMessage: 'Traefik HTTP routing verification failed',
+        };
+      }
+      log(`Traefik routing verified: Reverse proxy successfully routed HTTP 200 response.`);
+    }
+
+    return {
+      passed: true,
+      dockerHealth: dockerHealthStatus,
+      directHttpPassed: true,
+      traefikPassed,
+    };
+  }
+
+  /**
+   * Direct HTTP probe: tries containerId within Docker Compose network first,
+   * then host.docker.internal / localhost as fallback
+   */
+  private async probeDirectHttp(
+    containerId: string,
+    internalPort: number,
+    hostPort: number,
+    healthPath: string,
+    timeoutSec: number
+  ): Promise<boolean> {
+    const formattedPath = healthPath.startsWith('/') ? healthPath : `/${healthPath}`;
+
+    // Target 1: Container hostname inside localpaas_network (e.g. http://project-slug-xxxx:3000/api/health)
+    const containerTargetOk = await this.httpGet({
+      host: containerId,
+      port: internalPort,
+      path: formattedPath,
+      timeoutMs: timeoutSec * 1000,
+    });
+    if (containerTargetOk) return true;
+
+    // Target 2: Host port via localhost (if running directly on host)
+    const localhostOk = await this.httpGet({
+      host: 'localhost',
+      port: hostPort,
+      path: formattedPath,
+      timeoutMs: timeoutSec * 1000,
+    });
+    if (localhostOk) return true;
+
+    // Target 3: Host port via host.docker.internal / host gateway
+    const hostGatewayOk = await this.httpGet({
+      host: 'host.docker.internal',
+      port: hostPort,
+      path: formattedPath,
+      timeoutMs: timeoutSec * 1000,
+    });
+    return hostGatewayOk;
+  }
+
+  /**
+   * Verifies routing through Traefik by sending HTTP request with Host header to Traefik service
+   */
+  private async verifyTraefikRoute(
+    project: Project,
+    healthPath: string,
+    timeoutSec: number,
+    maxRetries: number = 8
+  ): Promise<boolean> {
+    const projectSlug = project.slug || project.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+    const domain = project.domain || `${projectSlug}.localhost`;
+    const formattedPath = healthPath.startsWith('/') ? healthPath : `/${healthPath}`;
+
+    // Traefik endpoints: 'traefik' service on port 80 inside localpaas_network, or localhost:80
+    const hostsToTry = ['traefik', 'localpaas_traefik', 'localhost', '127.0.0.1'];
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      for (const traefikHost of hostsToTry) {
+        const ok = await this.httpGet({
+          host: traefikHost,
+          port: 80,
+          path: formattedPath,
+          headers: {
+            Host: domain,
+            'User-Agent': 'LocalPaaS-TraefikVerifier/1.0',
+          },
+          timeoutMs: timeoutSec * 1000,
+        });
+
+        if (ok) {
+          return true;
+        }
+      }
+      await this.delay(1000);
     }
 
     return false;
   }
 
   /**
-   * Probes HTTP health endpoint
+   * Generic HTTP GET helper returning true for 2xx status code
    */
-  private probeHttpHealth(hostPort: number, healthPath: string, timeoutSec: number): Promise<boolean> {
+  private httpGet(options: {
+    host: string;
+    port: number;
+    path: string;
+    headers?: Record<string, string>;
+    timeoutMs: number;
+  }): Promise<boolean> {
     return new Promise((resolve) => {
-      const formattedPath = healthPath.startsWith('/') ? healthPath : `/${healthPath}`;
-      const options: http.RequestOptions = {
-        host: 'localhost',
-        port: hostPort,
-        path: formattedPath,
-        method: 'GET',
-        timeout: timeoutSec * 1000,
-        headers: {
-          'User-Agent': 'LocalPaaS-HealthCheck/1.0',
+      const req = http.request(
+        {
+          host: options.host,
+          port: options.port,
+          path: options.path,
+          method: 'GET',
+          headers: options.headers,
+          timeout: options.timeoutMs,
         },
-      };
-
-      const req = http.request(options, (res) => {
-        // Status code 2xx is considered healthy
-        const is2xx = (res.statusCode ?? 500) >= 200 && (res.statusCode ?? 500) < 300;
-        resolve(is2xx);
-      });
+        (res) => {
+          const is2xx = (res.statusCode ?? 500) >= 200 && (res.statusCode ?? 500) < 300;
+          resolve(is2xx);
+        }
+      );
 
       req.on('timeout', () => {
         req.destroy();
@@ -669,52 +821,78 @@ export class DockerRunner {
     paasStore.updateProject(project.id, { status: 'STOPPED' });
   }
 
-  public async startProject(project: Project): Promise<void> {
+  /**
+   * Start project using unified health verification service
+   */
+  public async startProject(project: Project): Promise<boolean> {
     const deploymentId = project.currentDeploymentId;
     if (deploymentId) {
       const dep = paasStore.getDeployment(deploymentId);
       if (dep && dep.containerId) {
         await this.dockerRequest('POST', `/containers/${dep.containerId}/start`).catch(() => {});
 
-        // Verify container is actually running before setting LIVE
-        try {
-          const inspectRes = await this.dockerRequest('GET', `/containers/${dep.containerId}/json`);
-          if (inspectRes.statusCode === 200 && inspectRes.json?.State?.Running) {
-            paasStore.updateProject(project.id, { status: 'LIVE' });
-            this.startStatsMonitoring(project.id, dep.containerId);
-            return;
-          }
-        } catch {
-          // ignore
+        // Unified health check
+        const health = await this.verifyContainerHealth({
+          project,
+          containerId: dep.containerId,
+          hostPort: dep.hostPort || 9010,
+          internalPort: project.internalPort || 3000,
+          deploymentId,
+          checkTraefik: true,
+        });
+
+        if (health.passed) {
+          paasStore.updateProject(project.id, { status: 'LIVE' });
+          paasStore.updateDeployment(deploymentId, { status: 'LIVE' });
+          this.startStatsMonitoring(project.id, dep.containerId);
+          return true;
+        } else {
+          paasStore.updateProject(project.id, { status: 'FAILED' });
+          paasStore.updateDeployment(deploymentId, {
+            status: 'HEALTH_CHECK_FAILED',
+            errorMessage: health.errorMessage || 'Health verification failed on startup',
+          });
+          return false;
         }
       }
     }
 
-    // If no prior running container or it failed, create fresh deployment
+    // If no prior container, execute fresh deployment
     const newDep = paasStore.createDeployment(project.id, 'manual-start-000', 'Manual server startup');
-    await this.executeDeployment(project, newDep);
+    return await this.executeDeployment(project, newDep);
   }
 
-  public async restartProject(project: Project): Promise<void> {
+  /**
+   * Restart project using unified zero-downtime health verification:
+   * Starts new/updated container, verifies health & Traefik route before switching.
+   */
+  public async restartProject(project: Project): Promise<boolean> {
     const deploymentId = project.currentDeploymentId;
-    if (deploymentId) {
-      const dep = paasStore.getDeployment(deploymentId);
-      if (dep && dep.containerId) {
-        await this.dockerRequest('POST', `/containers/${dep.containerId}/restart?t=5`).catch(() => {});
-
-        // Verify container is actually running
-        try {
-          const inspectRes = await this.dockerRequest('GET', `/containers/${dep.containerId}/json`);
-          if (inspectRes.statusCode === 200 && inspectRes.json?.State?.Running) {
-            paasStore.updateProject(project.id, { status: 'LIVE' });
-            this.startStatsMonitoring(project.id, dep.containerId);
-            return;
-          }
-        } catch {
-          // ignore
-        }
-      }
+    if (!deploymentId) {
+      return await this.startProject(project);
     }
+
+    const currentDep = paasStore.getDeployment(deploymentId);
+    if (!currentDep) {
+      return await this.startProject(project);
+    }
+
+    // Create a new restart deployment record using current commit/image
+    const restartDep = paasStore.createDeployment(
+      project.id,
+      currentDep.commitSha || 'restart-sha',
+      `Service restart: ${project.name}`
+    );
+
+    // Execute deployment with pre-built image reuse
+    const success = await this.executeDeployment(project, restartDep, {
+      reuseImageName: currentDep.imageName,
+    });
+
+    if (success) {
+      paasStore.updateProject(project.id, { status: 'LIVE' });
+    }
+    return success;
   }
 
   private startStatsMonitoring(projectId: string, containerId: string) {
