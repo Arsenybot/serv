@@ -1,6 +1,6 @@
 import assert from 'assert';
 import crypto from 'crypto';
-import { encryptValue, decryptValue, maskSecret, verifyGitHubSignature, generateProjectSlug } from '../server/crypto.ts';
+import { encryptValue, decryptValue, maskValue, verifyGitHubSignature, slugify } from '../server/crypto.ts';
 import { paasStore } from '../server/store.ts';
 import { dockerRunner } from '../server/docker-runner.ts';
 import { prepareSource } from '../server/source-preparer.ts';
@@ -42,16 +42,16 @@ async function runTestSuite() {
     const decrypted = decryptValue(encrypted);
     assert.strictEqual(decrypted, secret);
 
-    const masked = maskSecret(secret);
-    assert.strictEqual(masked.startsWith('••••'), true);
+    const masked = maskValue(secret);
+    assert.strictEqual(masked.startsWith('********'), true);
     assert.strictEqual(masked.endsWith('-xyz'), true);
   });
 
   // 2. DNS-compatible Slug Generation
   await test('DNS-compatible slug generation', () => {
-    assert.strictEqual(generateProjectSlug('My Awesome App!'), 'my-awesome-app');
-    assert.strictEqual(generateProjectSlug('App @ 2026 / Version 2.0'), 'app-2026-version-2-0');
-    assert.strictEqual(generateProjectSlug('---special---'), 'special');
+    assert.strictEqual(slugify('My Awesome App!'), 'my-awesome-app');
+    assert.strictEqual(slugify('App @ 2026 / Version 2.0'), 'app-2026-version-2-0');
+    assert.strictEqual(slugify('---special---'), 'special');
   });
 
   // 3. GitHub HMAC Webhook Signature Verification
@@ -105,6 +105,7 @@ async function runTestSuite() {
   await test('Test 1: OLD and NEW have separate isolated Traefik services (no shared pool)', async () => {
     const depOld = paasStore.createDeployment(testProject.id, 'commit-old-111', 'Old deployment', 'Arsenybot');
     const okOld = await dockerRunner.executeDeployment(testProject, depOld);
+
     assert.strictEqual(okOld, true);
 
     const oldService = paasStore.getDeployment(depOld.id)?.traefikServiceName;
@@ -321,7 +322,6 @@ async function runTestSuite() {
       'commit-old-111',
       'Rollback to v1.0',
       'Admin',
-      'ROLLBACK'
     );
 
     const success = await dockerRunner.executeDeployment(testProject, rollbackDep, {

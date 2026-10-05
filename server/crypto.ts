@@ -47,7 +47,7 @@ export function decryptValue(cipherText: string): string {
     return decrypted;
   } catch (err) {
     console.error('Failed to decrypt value:', err);
-    return '••••••••';
+    return '********';
   }
 }
 
@@ -55,8 +55,12 @@ export function decryptValue(cipherText: string): string {
  * Mask an environment variable value for UI display
  */
 export function maskValue(value: string): string {
-  if (!value) return '••••••••';
-  return '•'.repeat(Math.min(Math.max(value.length, 8), 16));
+  if (!value) return '********';
+
+  const visibleSuffix = value.length > 4 ? value.slice(-4) : '';
+  const maskedLength = Math.min(Math.max(value.length - visibleSuffix.length, 8), 16);
+
+  return '*'.repeat(maskedLength) + visibleSuffix;
 }
 
 /**
@@ -101,11 +105,3 @@ export function slugify(name: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '') || 'app';
 }
-
-export const generateProjectSlug = slugify;
-export const maskSecret = (val: string) => {
-  if (!val) return '••••';
-  if (val.length <= 6) return '••••';
-  return `••••${val.slice(-4)}`;
-};
-
