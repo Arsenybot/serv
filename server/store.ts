@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
-import { Project, Deployment, DeploymentLog, EnvironmentVariable, ProjectStats, BuildType } from './types.ts';
+import { Project, Deployment, DeploymentLog, EnvironmentVariable, ProjectStats, type BuildType } from './types.ts';
 import { encryptValue, maskValue, slugify } from './crypto.ts';
 
 class PaasStore extends EventEmitter {
