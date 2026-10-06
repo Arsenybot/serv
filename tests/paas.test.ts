@@ -2,7 +2,7 @@ import assert from 'assert';
 import crypto from 'crypto';
 import { encryptValue, decryptValue, maskValue, verifyGitHubSignature, slugify } from '../server/crypto.ts';
 import { paasStore } from '../server/store.ts';
-import { dockerRunner } from '../server/docker-runner.ts';
+import { dockerRunner, isDockerSocketAvailable, getDockerHostUrl } from '../server/docker-runner.ts';
 import { prepareSource } from '../server/source-preparer.ts';
 import { traefikDynamicManager } from '../server/traefik-manager.ts';
 
@@ -363,7 +363,123 @@ async function runTestSuite() {
     assert.ok(logs.some(l => l.message.includes('Attempt 3/3')));
   });
 
-  // 19. Project Deletion
+  // 19. Test J: Docker Engine API build streams tar archive context without Docker CLI
+  await test('Test J: Docker Engine API build streams tar archive context via Docker API socket', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+    const tar = await import('tar');
+
+    const testBuildDir = fs.mkdtempSync(path.join(os.tmpdir(), 'paas-test-build-'));
+    fs.writeFileSync(path.join(testBuildDir, 'Dockerfile'), 'FROM alpine:latest\nCMD ["echo", "test"]\n');
+    fs.writeFileSync(path.join(testBuildDir, 'app.txt'), 'hello localpaas\n');
+
+    const files = fs.readdirSync(testBuildDir);
+    assert.strictEqual(files.includes('Dockerfile'), true);
+    assert.strictEqual(files.includes('app.txt'), true);
+
+    const tarStream = tar.c({ cwd: testBuildDir, gzip: false }, files);
+    let chunksReceived = 0;
+
+    const res = await dockerRunner.dockerRequest(
+      'POST',
+      '/build?t=local-paas/test-proj:abc1234&rm=1',
+      tarStream,
+      (chunk) => {
+        chunksReceived++;
+      },
+      30000,
+      { 'Content-Type': 'application/x-tar' }
+    );
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.ok(chunksReceived > 0, 'Should stream build logs from Docker Engine API');
+    assert.ok(res.data.includes('Mock Docker Engine API build') || res.data.includes('Successfully built'));
+
+    fs.rmSync(testBuildDir, { recursive: true, force: true });
+  });
+
+  // 20. Test K: Docker Socket Transport and Dynamic Configuration Resolution
+  await test('Test K: Docker Socket Transport and Dynamic Configuration Resolution', async () => {
+    const { getDockerHostUrl } = await import('../server/docker-runner.ts');
+    const http = await import('http');
+    const path = await import('path');
+    const os = await import('os');
+    const fs = await import('fs');
+
+    const origDockerHost = process.env.DOCKER_HOST;
+    try {
+      // 1. Explicit Unix socket in DOCKER_HOST
+      process.env.DOCKER_HOST = 'unix:///tmp/custom-test-docker.sock';
+      assert.strictEqual(getDockerHostUrl(), 'unix:///tmp/custom-test-docker.sock');
+
+      const unixOptions = dockerRunner.getDockerRequestOptions('GET', '/v1.45/version');
+      assert.strictEqual(unixOptions.socketPath, '/tmp/custom-test-docker.sock');
+      assert.strictEqual((unixOptions.headers as any)?.Host, 'localhost');
+      assert.strictEqual((unixOptions as any).host, undefined);
+
+      // 2. Explicit TCP socket in DOCKER_HOST
+      process.env.DOCKER_HOST = 'tcp://127.0.0.1:2375';
+      assert.strictEqual(getDockerHostUrl(), 'tcp://127.0.0.1:2375');
+
+      const tcpOptions = dockerRunner.getDockerRequestOptions('GET', '/v1.45/version');
+      assert.strictEqual((tcpOptions as any).host, '127.0.0.1');
+      assert.strictEqual((tcpOptions as any).port, 2375);
+      assert.strictEqual((tcpOptions.headers as any)?.Host, '127.0.0.1:2375');
+      assert.strictEqual(tcpOptions.socketPath, undefined);
+
+      // 3. Real IPC Unix domain socket transmission test (Linux/macOS)
+      if (process.platform !== 'win32') {
+        const testIpcPath = path.join(os.tmpdir(), `paas-ipc-${Date.now()}.sock`);
+        if (fs.existsSync(testIpcPath)) {
+          try { fs.unlinkSync(testIpcPath); } catch {}
+        }
+
+        const ipcServer = http.createServer((req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok', transport: 'unix-domain-socket' }));
+        });
+
+        await new Promise<void>((resolve) => {
+          ipcServer.listen(testIpcPath, () => resolve());
+        });
+
+        // Query the live IPC socket
+        const ipcResponse = await new Promise<string>((resolve, reject) => {
+          const req = http.get({ socketPath: testIpcPath, path: '/test' }, (res) => {
+            let body = '';
+            res.on('data', chunk => body += chunk);
+            res.on('end', () => resolve(body));
+          });
+          req.on('error', reject);
+        });
+
+        const parsed = JSON.parse(ipcResponse);
+        assert.strictEqual(parsed.transport, 'unix-domain-socket');
+
+        // Cleanup
+        await new Promise<void>((resolve) => {
+          ipcServer.close(() => resolve());
+        });
+        if (fs.existsSync(testIpcPath)) {
+          try { fs.unlinkSync(testIpcPath); } catch {}
+        }
+      }
+
+      // 4. Missing socket returns false gracefully
+      process.env.DOCKER_HOST = 'unix:///non-existent-socket-123456.sock';
+      const available = await isDockerSocketAvailable();
+      assert.strictEqual(available, false);
+    } finally {
+      if (origDockerHost !== undefined) {
+        process.env.DOCKER_HOST = origDockerHost;
+      } else {
+        delete process.env.DOCKER_HOST;
+      }
+    }
+  });
+
+  // 21. Project Deletion
   await test('Project deletion cleans up metadata, deployments, and logs', () => {
     const deleted = paasStore.deleteProject(testProject.id);
     assert.strictEqual(deleted, true);

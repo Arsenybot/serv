@@ -84,24 +84,24 @@ app.get('/api/events', (req: Request, res: Response) => {
 
 
 // System Health & Engine Status
-app.get('/api/health', (_req: Request, res: Response) => {
+app.get('/api/health', async (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    dockerSocketAvailable: isDockerSocketAvailable(),
+    dockerSocketAvailable: await isDockerSocketAvailable(),
     uptime: process.uptime(),
     version: '1.0.0',
   });
 });
 
-app.get('/api/system/status', (_req: Request, res: Response) => {
+app.get('/api/system/status', async (_req: Request, res: Response) => {
   const projects = paasStore.getProjects();
   const liveCount = projects.filter(p => p.status === 'LIVE').length;
   const buildingCount = projects.filter(p => p.status === 'BUILDING').length;
   const failedCount = projects.filter(p => p.status === 'FAILED' || p.status === 'CRASHED').length;
 
   res.json({
-    dockerAvailable: isDockerSocketAvailable(),
+    dockerAvailable: await isDockerSocketAvailable(),
     traefikDomain: process.env.TRAEFIK_DOMAIN || 'localhost',
     cloudflareActive: Boolean(process.env.CLOUDFLARE_TUNNEL_TOKEN),
     githubTokenConfigured: Boolean(process.env.GITHUB_TOKEN),

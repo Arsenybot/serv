@@ -12,6 +12,7 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=localpaas_network"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
@@ -19,7 +20,7 @@ services:
       - "80:80"        # Public application traffic
       - "8080:8080"    # Traefik Dashboard
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
       - traefik_data:/etc/traefik
       - traefik_dynamic:/etc/traefik/dynamic
     networks:
@@ -85,8 +86,9 @@ services:
       - MAX_DEPLOYMENTS_PER_PROJECT=${MAX_DEPLOYMENTS_PER_PROJECT:-10}
       - JWT_SECRET=${JWT_SECRET:-super_secret_jwt_key_for_internal_auth}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-super_secret_aes256_encryption_key_32_bytes_long}
+      - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
       - build_cache:/tmp/localpaas_builds
       - traefik_dynamic:/etc/traefik/dynamic
     depends_on:

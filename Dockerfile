@@ -16,8 +16,8 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-# Install Docker CLI and Git for building images and pulling repositories
-RUN apk add --no-cache docker-cli git curl bash
+# Install Git and utilities for pulling repositories
+RUN apk add --no-cache git curl bash
 
 ENV NODE_ENV=production
 ENV PORT=3000

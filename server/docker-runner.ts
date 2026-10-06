@@ -1,23 +1,101 @@
+import fs from 'fs';
 import http from 'http';
 import path from 'path';
-import { spawn } from 'child_process';
+import * as tar from 'tar';
 import { paasStore } from './store.ts';
 import { Project, Deployment } from './types.ts';
 import { decryptValue } from './crypto.ts';
 import { prepareSource, cleanupSourceDir } from './source-preparer.ts';
 import { traefikDynamicManager } from './traefik-manager.ts';
 
-const DOCKER_HOST_URL =
-  process.env.DOCKER_HOST ||
-  'npipe:////./pipe/dockerDesktopLinuxEngine';
+/**
+ * Resolves the active Docker Engine API endpoint URL.
+ * Supports:
+ * - process.env.DOCKER_HOST (e.g. unix:///var/run/docker.sock, tcp://localhost:2375, npipe:////./pipe/docker_engine)
+ * - Platform detection (Windows named pipe vs Linux Unix domain socket)
+ * - Automatic detection of mounted socket at /var/run/docker.sock or /run/docker.sock
+ */
+export function getDockerHostUrl(): string {
+  const envHost = process.env.DOCKER_HOST?.trim().replace(/^["']|["']$/g, '');
+  if (envHost) {
+    if (envHost.startsWith('unix://') || envHost.startsWith('/')) {
+      const cleanPath = envHost.replace(/^unix:\/\//, '');
+      if (fs.existsSync(cleanPath)) {
+        return `unix://${cleanPath}`;
+      }
+      if (fs.existsSync('/var/run/docker.sock')) {
+        return 'unix:///var/run/docker.sock';
+      }
+      if (fs.existsSync('/run/docker.sock')) {
+        return 'unix:///run/docker.sock';
+      }
+      return `unix://${cleanPath}`;
+    }
+    return envHost;
+  }
+
+  // Windows host outside container
+  if (process.platform === 'win32') {
+    return 'npipe:////./pipe/dockerDesktopLinuxEngine';
+  }
+
+  // Linux / Container: Check available mounted Docker socket paths
+  if (fs.existsSync('/var/run/docker.sock')) {
+    return 'unix:///var/run/docker.sock';
+  }
+  if (fs.existsSync('/run/docker.sock')) {
+    return 'unix:///run/docker.sock';
+  }
+
+  return 'unix:///var/run/docker.sock';
+}
 
 // Check if Docker API is reachable
 export async function isDockerSocketAvailable(): Promise<boolean> {
   return new Promise((resolve) => {
     try {
+      const dockerHost = getDockerHostUrl();
+
+      // Unix domain socket (standard Linux / Docker container mount)
+      if (
+        dockerHost.startsWith('unix://') ||
+        (!dockerHost.startsWith('tcp://') &&
+          !dockerHost.startsWith('http://') &&
+          !dockerHost.startsWith('npipe://') &&
+          dockerHost.startsWith('/'))
+      ) {
+        const socketPath = dockerHost.replace(/^unix:\/\//, '');
+        if (!fs.existsSync(socketPath)) {
+          resolve(false);
+          return;
+        }
+
+        const req = http.get(
+          {
+            socketPath,
+            path: '/v1.45/version',
+            method: 'GET',
+            headers: { Host: 'localhost' },
+            timeout: 2000,
+          },
+          (res) => {
+            resolve(res.statusCode === 200);
+          }
+        );
+
+        req.on('error', () => resolve(false));
+
+        req.on('timeout', () => {
+          req.destroy();
+          resolve(false);
+        });
+
+        return;
+      }
+
       // Docker Desktop on Windows uses a named pipe.
-      if (DOCKER_HOST_URL.startsWith('npipe://')) {
-        const socketPath = DOCKER_HOST_URL
+      if (dockerHost.startsWith('npipe://')) {
+        const socketPath = dockerHost
           .replace('npipe:////', '//')
           .replace(/\//g, '\\');
 
@@ -26,6 +104,7 @@ export async function isDockerSocketAvailable(): Promise<boolean> {
             socketPath,
             path: '/v1.45/version',
             method: 'GET',
+            headers: { Host: 'localhost' },
             timeout: 2000,
           },
           (res) => {
@@ -46,9 +125,9 @@ export async function isDockerSocketAvailable(): Promise<boolean> {
       // TCP Docker host
       const parsedUrl = new URL(
         '/v1.45/version',
-        DOCKER_HOST_URL.startsWith('tcp://')
-          ? DOCKER_HOST_URL.replace('tcp://', 'http://')
-          : DOCKER_HOST_URL
+        dockerHost.startsWith('tcp://')
+          ? dockerHost.replace('tcp://', 'http://')
+          : dockerHost
       );
 
       const req = http.get(parsedUrl, { timeout: 2000 }, (res) => {
@@ -100,36 +179,56 @@ export interface UnifiedHealthCheckResult {
 export class DockerRunner {
   private containerStatsIntervals: Map<string, NodeJS.Timeout> = new Map();
 
-  private getDockerRequestOptions(
+  public getDockerRequestOptions(
     method: string,
-    reqPath: string
+    reqPath: string,
+    customHeaders?: Record<string, string>
   ): http.RequestOptions {
-    const dockerHost = DOCKER_HOST_URL;
+    const dockerHost = getDockerHostUrl();
+
+    let targetConfig: http.RequestOptions;
+    if (
+      dockerHost.startsWith('unix://') ||
+      (!dockerHost.startsWith('tcp://') &&
+        !dockerHost.startsWith('http://') &&
+        !dockerHost.startsWith('npipe://') &&
+        dockerHost.startsWith('/'))
+    ) {
+      targetConfig = {
+        socketPath: dockerHost.replace(/^unix:\/\//, ''),
+        headers: {
+          Host: 'localhost',
+        },
+      };
+    } else if (dockerHost.startsWith('npipe://')) {
+      targetConfig = {
+        socketPath: dockerHost
+          .replace('npipe:////', '//')
+          .replace(/\//g, '\\'),
+        headers: {
+          Host: 'localhost',
+        },
+      };
+    } else {
+      const clean = dockerHost.replace('tcp://', '').replace('http://', '');
+      const [host, portStr] = clean.split(':');
+      targetConfig = {
+        host: host || 'localhost',
+        port: parseInt(portStr || '2375', 10),
+        headers: {
+          Host: `${host || 'localhost'}:${portStr || '2375'}`,
+        },
+      };
+    }
 
     return {
-      ...(dockerHost.startsWith('npipe://')
-        ? {
-            socketPath: dockerHost
-              .replace('npipe:////', '//')
-              .replace(/\//g, '\\'),
-          }
-        : {
-            host: dockerHost
-              .replace('tcp://', '')
-              .replace('http://', '')
-              .split(':')[0] || 'localhost',
-            port: parseInt(
-              dockerHost
-                .replace('tcp://', '')
-                .replace('http://', '')
-                .split(':')[1] || '2375',
-              10
-            ),
-          }),
+      ...targetConfig,
       method,
       path: reqPath.startsWith('/v1.') ? reqPath : `/v1.45${reqPath}`,
       headers: {
         'Content-Type': 'application/json',
+        ...targetConfig.headers,
+        ...customHeaders,
       },
     };
   }
@@ -142,11 +241,45 @@ export class DockerRunner {
   reqPath: string,
   body?: any,
   onChunk?: (data: string) => void,
-  timeoutMs: number = 300000
+  timeoutMs: number = 300000,
+  headers?: Record<string, string>
 ): Promise<{ statusCode: number; data: string; json?: any }> {
   // Deterministic Docker API mock for tests.
   // Tests should not require a real Docker daemon or real images.
   if (process.env.NODE_ENV === 'test') {
+    if (method === 'POST' && reqPath.includes('/build')) {
+      if (body && typeof body.resume === 'function') {
+        return new Promise((resolve) => {
+          body.on('end', () => {
+            const mockOutput = '{"stream":"Step 1/2 : Mock Docker Engine API build\\n"}\n{"stream":"Successfully built mock123\\n"}\n';
+            if (onChunk) {
+              onChunk(mockOutput);
+            }
+            resolve({
+              statusCode: 200,
+              data: mockOutput,
+              json: { stream: 'Successfully built mock123\n' },
+            });
+          });
+          body.on('error', () => {
+            resolve({
+              statusCode: 200,
+              data: '',
+            });
+          });
+          body.resume();
+        });
+      }
+      const mockOutput = '{"stream":"Step 1/2 : Mock Docker Engine API build\\n"}\n{"stream":"Successfully built mock123\\n"}\n';
+      if (onChunk) {
+        onChunk(mockOutput);
+      }
+      return Promise.resolve({
+        statusCode: 200,
+        data: mockOutput,
+        json: { stream: 'Successfully built mock123\n' },
+      });
+    }
     if (method === 'POST' && reqPath.includes('/containers/create')) {
       return Promise.resolve({
         statusCode: 201,
@@ -247,7 +380,7 @@ export class DockerRunner {
     }
   }
 
-  const options = this.getDockerRequestOptions(method, reqPath);
+  const options = this.getDockerRequestOptions(method, reqPath, headers);
 
   return new Promise((resolve, reject) => {
     const req = http.request(options, (res) => {
@@ -287,11 +420,24 @@ export class DockerRunner {
       reject(err);
     });
 
-    if (body) {
-      req.write(typeof body === 'string' ? body : JSON.stringify(body));
+    if (body && typeof (body as any).pipe === 'function') {
+      body.on('error', (err: any) => {
+        req.destroy(err);
+        reject(err);
+      });
+      body.pipe(req);
+    } else if (body !== undefined && body !== null) {
+      if (Buffer.isBuffer(body)) {
+        req.write(body);
+      } else if (typeof body === 'string') {
+        req.write(body);
+      } else {
+        req.write(JSON.stringify(body));
+      }
+      req.end();
+    } else {
+      req.end();
     }
-
-    req.end();
   });
 }
 
@@ -736,78 +882,158 @@ export class DockerRunner {
   }
 
   /**
-   * Builds Docker image using local source tree
+   * Builds Docker image using local source context via Docker Engine API POST /build.
+   * Completely replaces external `docker build` CLI with Docker socket tar streaming.
    */
-  private async buildLocalDockerImage(
+  public async buildLocalDockerImage(
     sourceDir: string,
     imageName: string,
     deploymentId: string,
     project: Project
   ): Promise<boolean> {
-    if (process.env.NODE_ENV === 'test') {
-      return true;
-    }
+    paasStore.addLog(deploymentId, 'build', `Invoking Docker Engine API build for ${imageName}...`);
 
-      const dockerHost = process.env.DOCKER_HOST;
+    try {
+      if (!fs.existsSync(sourceDir)) {
+        paasStore.addLog(deploymentId, 'stderr', `Source build directory not found: ${sourceDir}`);
+        return false;
+      }
 
-    return new Promise((resolve) => {
-      paasStore.addLog(deploymentId, 'build', `Invoking docker build for ${imageName} in ${sourceDir}...`);
+      const files = fs.readdirSync(sourceDir);
+      if (files.length === 0) {
+        paasStore.addLog(deploymentId, 'stderr', `Source build directory is empty: ${sourceDir}`);
+        return false;
+      }
 
-      const dockerfileArg = project.dockerfilePath && project.dockerfilePath !== 'Dockerfile'
-        ? ['-f', path.join(sourceDir, project.dockerfilePath)]
-        : [];
+      // Check Dockerfile presence
+      const relDockerfilePath = project.dockerfilePath && project.dockerfilePath.trim() !== ''
+        ? project.dockerfilePath.trim()
+        : 'Dockerfile';
+      const absDockerfilePath = path.join(sourceDir, relDockerfilePath);
+      if (!fs.existsSync(absDockerfilePath)) {
+        paasStore.addLog(deploymentId, 'stderr', `Dockerfile not found at expected path: ${relDockerfilePath}`);
+        return false;
+      }
 
-      const dockerArgs = [
-        ...(dockerHost ? ['-H', dockerHost] : []),
-        'build',
-        '-t',
-        imageName,
-        ...dockerfileArg,
-        '.',
-      ];
+      // In unit test environment without Docker daemon, log the steps and return success
+      if (process.env.NODE_ENV === 'test') {
+        paasStore.addLog(deploymentId, 'build', `Packaging context tar archive from ${sourceDir}...`);
+        const queryParams = new URLSearchParams({
+          t: imageName,
+          rm: '1',
+        });
+        if (relDockerfilePath !== 'Dockerfile') {
+          queryParams.set('dockerfile', relDockerfilePath);
+        }
+        const buildEndpoint = `/build?${queryParams.toString()}`;
+        paasStore.addLog(deploymentId, 'build', `Streaming context tar archive to Docker Engine API: POST ${buildEndpoint}...`);
+        paasStore.addLog(deploymentId, 'build', `Successfully built and tagged image: ${imageName}`);
+        return true;
+      }
 
-      const child = spawn('docker', dockerArgs, {
-        cwd: sourceDir,
-        env: {
-          ...process.env,
-          ...(dockerHost ? { DOCKER_HOST: dockerHost } : {}),
+      // Verify Docker socket availability before packaging and streaming build context
+      const dockerHost = getDockerHostUrl();
+      if (
+        (dockerHost.startsWith('unix://') || dockerHost.startsWith('/')) &&
+        process.env.NODE_ENV !== 'test'
+      ) {
+        const socketPath = dockerHost.replace(/^unix:\/\//, '');
+        if (!fs.existsSync(socketPath)) {
+          paasStore.addLog(
+            deploymentId,
+            'stderr',
+            `Docker socket not found at ${socketPath}. Ensure '${socketPath}' is mounted into the container in docker-compose.yml (volumes: - /var/run/docker.sock:/var/run/docker.sock) and Docker Engine is running on host.`
+          );
+          return false;
+        }
+      }
+
+      paasStore.addLog(deploymentId, 'build', `Packaging context tar archive from ${sourceDir}...`);
+
+      const tarStream = tar.c(
+        {
+          cwd: sourceDir,
+          gzip: false,
         },
-      });
+        files
+      );
 
-      child.stdout.on('data', (d) => {
-        const lines = d.toString().split('\n');
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) {
-            paasStore.addLog(deploymentId, 'build', trimmed);
+      // Construct Docker Engine API build endpoint
+      const queryParams = new URLSearchParams({
+        t: imageName,
+        rm: '1',
+      });
+      if (relDockerfilePath !== 'Dockerfile') {
+        queryParams.set('dockerfile', relDockerfilePath);
+      }
+
+      const buildEndpoint = `/build?${queryParams.toString()}`;
+      paasStore.addLog(deploymentId, 'build', `Streaming context tar archive to Docker Engine API: POST ${buildEndpoint}...`);
+
+      let buildError: string | null = null;
+      let lineBuffer = '';
+
+      const processJsonLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.stream) {
+            const streamMsg = parsed.stream.replace(/\r?\n$/, '');
+            if (streamMsg) {
+              paasStore.addLog(deploymentId, 'build', streamMsg);
+            }
+          } else if (parsed.status) {
+            paasStore.addLog(deploymentId, 'build', parsed.status);
+          } else if (parsed.error || parsed.errorDetail) {
+            const errMsg = parsed.error || parsed.errorDetail?.message || 'Unknown build error';
+            buildError = errMsg;
+            paasStore.addLog(deploymentId, 'stderr', `Docker build error: ${errMsg}`);
           }
+        } catch {
+          paasStore.addLog(deploymentId, 'build', trimmed);
         }
-      });
+      };
 
-      child.stderr.on('data', (d) => {
-        const lines = d.toString().split('\n');
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) {
-            paasStore.addLog(deploymentId, trimmed.includes('error') ? 'stderr' : 'build', trimmed);
+      const res = await this.dockerRequest(
+        'POST',
+        buildEndpoint,
+        tarStream,
+        (chunk) => {
+          lineBuffer += chunk;
+          const lines = lineBuffer.split('\n');
+          lineBuffer = lines.pop() || '';
+          for (const line of lines) {
+            processJsonLine(line);
           }
+        },
+        600000,
+        {
+          'Content-Type': 'application/x-tar',
         }
-      });
+      );
 
-      child.on('error', (err) => {
-        paasStore.addLog(deploymentId, 'stderr', `Docker build spawn error: ${err.message}`);
-        resolve(false);
-      });
+      if (lineBuffer.trim()) {
+        processJsonLine(lineBuffer);
+      }
 
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve(true);
-        } else {
-          paasStore.addLog(deploymentId, 'stderr', `Docker build process exited with code ${code}`);
-          resolve(false);
-        }
-      });
-    });
+      if (res.statusCode >= 400) {
+        paasStore.addLog(deploymentId, 'stderr', `Docker Engine API returned HTTP ${res.statusCode}: ${res.data}`);
+        return false;
+      }
+
+      if (buildError) {
+        paasStore.addLog(deploymentId, 'stderr', `Docker image build failed: ${buildError}`);
+        return false;
+      }
+
+      paasStore.addLog(deploymentId, 'build', `Successfully built and tagged image: ${imageName}`);
+      return true;
+    } catch (err: any) {
+      paasStore.addLog(deploymentId, 'stderr', `Docker build API exception: ${err.message || String(err)}`);
+      return false;
+    }
   }
 
   /**
