@@ -213,7 +213,8 @@ export async function prepareSource(options: {
   const targetDir = path.join(baseTmpDir, buildId);
 
   // In unit test environment, handle mock test repo
-  if (process.env.NODE_ENV === 'test' && repositoryUrl.includes('test-app') && !forceTarballFallback) {
+  const isMockableTestRepo = repositoryUrl.includes('test-app') || repositoryUrl.includes('botsig');
+  if (process.env.NODE_ENV === 'test' && isMockableTestRepo && !forceTarballFallback) {
     fs.mkdirSync(targetDir, { recursive: true });
     fs.writeFileSync(path.join(targetDir, 'Dockerfile'), 'FROM node:20-alpine\nEXPOSE 3000\n');
     onLog(`Attempt 1/1: Mock repository source prepared for test.`);
@@ -226,6 +227,7 @@ export async function prepareSource(options: {
       sourceType: 'git-clone',
     };
   }
+
 
 
   // Format auth URL safely without logging token
@@ -375,13 +377,14 @@ export async function prepareSource(options: {
   let resolvedMeta = await resolveGitHubCommitSha(coords.owner, coords.repo, targetRef, githubToken);
 
   // If in unit test environment and testing tarball fallback, provide test SHA for mock test-app
-  if (!resolvedMeta && process.env.NODE_ENV === 'test' && targetCommit && repositoryUrl.includes('test-app')) {
+  if (!resolvedMeta && process.env.NODE_ENV === 'test' && targetCommit && (repositoryUrl.includes('test-app') || repositoryUrl.includes('botsig'))) {
     resolvedMeta = {
       sha: targetCommit,
       message: 'Test tarball commit',
       author: 'Test Runner',
     };
   }
+
 
 
   if (!resolvedMeta || !resolvedMeta.sha) {
