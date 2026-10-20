@@ -9,7 +9,7 @@ import os from 'os';
  * Architecture:
  * - Dynamic config directory: /etc/traefik/dynamic (or local fallback in /tmp/traefik_dynamic)
  * - Traefik watches this directory for real-time atomic updates.
- * - Each project has an isolated configuration file: `<projectSlug>.json`
+ * - Each project has an isolated configuration file: `<projectSlug>.yml`
  * - Production router (`<projectSlug>`) explicitly points to EXACTLY ONE deployment service.
  * - Verification router (`<projectSlug>-verify-<depShortId>`) points exclusively to the new deployment's service.
  * - OLD and NEW never share a load-balancing pool.
@@ -41,11 +41,13 @@ export class TraefikDynamicManager {
   }
 
   private getConfigPath(projectSlug: string): string {
-    return path.join(this.dynamicDir, `${projectSlug}.json`);
+    return path.join(this.dynamicDir, `${projectSlug}.yml`);
   }
 
+  
   /**
-   * Reads current configuration for a project from disk or memory
+   * Reads current configuration from memory, then .yml, then legacy .json.
+   * Legacy files remain untouched until migration is explicitly verified.
    */
   public getProjectConfig(projectSlug: string): any {
     const memory = this.inMemoryConfigs.get(projectSlug);
@@ -53,15 +55,28 @@ export class TraefikDynamicManager {
       return JSON.parse(JSON.stringify(memory));
     }
 
-    const filePath = this.getConfigPath(projectSlug);
-    if (fs.existsSync(filePath)) {
+    const configPaths = [
+      this.getConfigPath(projectSlug),
+      path.join(this.dynamicDir, `${projectSlug}.json`),
+    ];
+
+    for (const filePath of configPaths) {
+      if (!fs.existsSync(filePath)) {
+        continue;
+      }
+
       try {
         const raw = fs.readFileSync(filePath, 'utf-8');
         const parsed = JSON.parse(raw);
+
         this.inMemoryConfigs.set(projectSlug, parsed);
         return parsed;
-      } catch {
-        // ignore
+      } catch (err: any) {
+        if (process.env.NODE_ENV !== 'test') {
+          console.warn(
+            `[TraefikDynamicManager] Could not read ${filePath}: ${err.message}`
+          );
+        }
       }
     }
 
@@ -73,10 +88,21 @@ export class TraefikDynamicManager {
     };
   }
 
+
   /**
    * Writes the project dynamic configuration atomically
    */
   public writeProjectConfig(projectSlug: string, config: any): void {
+    
+    console.log(
+      `[TRAEFIK WRITE] project=${projectSlug}`,
+      JSON.stringify({
+        routers: Object.keys(config.http?.routers || {}),
+        services: Object.keys(config.http?.services || {}),
+        productionService: config.http?.routers?.[projectSlug]?.service ?? null,
+      })
+    );
+
     this.inMemoryConfigs.set(projectSlug, config);
 
     try {
@@ -181,6 +207,11 @@ export class TraefikDynamicManager {
    * Removes a retired deployment service from Traefik
    */
   public removeDeploymentService(projectSlug: string, traefikServiceName: string): void {
+    
+    console.log(
+      `[TRAEFIK REMOVE SERVICE] project=${projectSlug} service=${traefikServiceName}`
+    );
+    
     const config = this.getProjectConfig(projectSlug);
     if (config.http?.services?.[traefikServiceName]) {
       delete config.http.services[traefikServiceName];

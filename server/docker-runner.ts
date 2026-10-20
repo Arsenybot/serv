@@ -596,13 +596,7 @@ export class DockerRunner {
         Image: imageName,
         name: containerId,
         Env: envList,
-        Labels: {
-          'traefik.enable': 'true',
-          [`traefik.http.routers.${verificationRouterName}.rule`]: `Host(\`${verificationHost}\`)`,
-          [`traefik.http.routers.${verificationRouterName}.entrypoints`]: 'web',
-          [`traefik.http.routers.${verificationRouterName}.service`]: traefikServiceName,
-          [`traefik.http.services.${traefikServiceName}.loadbalancer.server.port`]: String(targetInternalPort),
-        },
+        Labels: {},
         HostConfig: {
           NetworkMode: 'localpaas_network',
           PortBindings: {

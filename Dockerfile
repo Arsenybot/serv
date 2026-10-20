@@ -1,11 +1,12 @@
-# Multi-stage Dockerfile for LocalPaaS
+﻿# Multi-stage Dockerfile for LocalPaaS
 FROM node:22-alpine AS builder
 
 WORKDIR /app
 
 # Install dependencies
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --include=optional --no-audit --no-fund
+RUN npm install --no-save --include=optional --no-audit --no-fund @rolldown/binding-linux-x64-musl@1.2.12
 
 # Copy sources and build frontend bundle
 COPY . .
@@ -34,3 +35,4 @@ COPY --from=builder /app/prisma ./prisma
 EXPOSE 3000
 
 CMD ["npx", "tsx", "server.ts"]
+

@@ -3,16 +3,13 @@ version: '3.8'
 services:
   # Traefik Reverse Proxy with automatic Docker container discovery and dynamic file provider
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.6.4
     container_name: localpaas_traefik
     restart: unless-stopped
     command:
       - "--api.insecure=true"
       - "--api.dashboard=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=localpaas_network"
-      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--log.level=DEBUG"
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
@@ -20,7 +17,6 @@ services:
       - "80:80"        # Public application traffic
       - "8080:8080"    # Traefik Dashboard
     volumes:
-      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
       - traefik_data:/etc/traefik
       - traefik_dynamic:/etc/traefik/dynamic
     networks:
@@ -98,12 +94,7 @@ services:
         condition: service_healthy
     networks:
       - localpaas_network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.paas.rule=Host(`paas.localhost`)"
-      - "traefik.http.routers.paas.entrypoints=web"
-      - "traefik.http.services.paas.loadbalancer.server.port=3000"
-
+    
   # Optional Cloudflare Tunnel for zero-config public domain exposure
   cloudflared:
     image: cloudflare/cloudflared:latest
